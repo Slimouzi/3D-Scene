@@ -47,7 +47,8 @@ class Run:
         config_path = Path(config_path).resolve()
         self.config = read(config_path)
         allowed = {'schema_version', 'kind', 'input', 'output', 'erp_width', 'num_threads',
-                   'seed', 'max_features', 'mapping_max_seconds', 'masks', 'auto_mask_backend'}
+                   'seed', 'max_features', 'mapping_max_seconds', 'masks', 'auto_mask_backend',
+                   'semantic_run'}
         if set(self.config) - allowed:
             raise ValueError(f'Unknown config keys: {set(self.config) - allowed}')
         if self.config.get('kind') != 'diagnostic':
@@ -80,10 +81,26 @@ class Run:
                 path = (config_path.parent / name).resolve()
                 self.mask_paths[pano][kind] = path
                 mask_hashes[pano][kind] = digest(path)
+        self.config_dir = config_path.parent
+        semantic = None
+        if self.config.get('semantic_run'):
+            # Masked SfM experiment: geometry masks come from a verified ACCEPTED segmentation run.
+            from .segmentation.fusion import source_semantics
+            source, geometry = source_semantics(self.config_dir, self.config)
+            if set(geometry) != {p.stem for p in self.sources}:
+                raise ValueError('semantic_run does not cover exactly the input panoramas')
+            for pano, path in geometry.items():
+                if 'geometry' in self.mask_paths.get(pano, {}):
+                    raise ValueError(f'{pano}: geometry mask given both in masks and semantic_run')
+                self.mask_paths.setdefault(pano, {})['geometry'] = path
+                mask_hashes.setdefault(pano, {})['geometry'] = digest(path)
+            semantic = {'run': self.config['semantic_run'],
+                        'semantic_masks_sha256': digest(source / 'semantic_masks.json')}
         self.provenance = {
             'config': self.config, 'inputs': {p.name: digest(p) for p in self.sources},
-            'masks': mask_hashes,
-            'code': {p.name: digest(p) for p in sorted(Path(__file__).parent.glob('*.py'))},
+            'masks': mask_hashes, 'semantic_run': semantic,
+            'code': {str(p.relative_to(Path(__file__).parent)): digest(p)
+                     for p in sorted(Path(__file__).parent.rglob('*.py'))},
             'versions': {p: version(p) for p in ('numpy', 'Pillow', 'pycolmap', 'opencv-python-headless')},
             'python': platform.python_version(),
         }

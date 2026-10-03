@@ -9,5 +9,6 @@
   "max_features": 8192,
   "mapping_max_seconds": 600,
   "masks": {},
-  "auto_mask_backend": "sam3"
+  "auto_mask_backend": "sam3",
+  "semantic_run": "salon-sam3-001"
 }

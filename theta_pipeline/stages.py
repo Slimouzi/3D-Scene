@@ -8,6 +8,8 @@ from PIL import Image, ImageDraw
 import pycolmap as pc
 from pycolmap import panorama
 from .geometry import homogeneous, project, ownership
+from .segmentation import fusion
+from .segmentation.faces import prepare_faces
 from .storage import digest, now, read, write
 
 
@@ -47,9 +49,23 @@ def audit(run):
     return [run.path / 'capture.json']
 
 
+def seg_faces(run):
+    return prepare_faces(run, rotations())
+
+
+def seg_trial(run):
+    if run.config.get('auto_mask_backend') != 'sam3':
+        raise RuntimeError('seg-trial requires "auto_mask_backend": "sam3" in the config')
+    return fusion.trial(run)
+
+
 def auto_mask(run):
     run.require('audit')
     backend = run.config.get('auto_mask_backend', 'unavailable')
+    if run.config.get('semantic_run'):
+        return fusion.import_semantics(run)
+    if backend == 'sam3':
+        return fusion.all_panoramas(run)
     records = []
     for source in run.sources:
         records.append({'panorama_id': source.stem, 'status': 'UNKNOWN',
@@ -375,6 +391,17 @@ def report(run):
 def partition(run):
     run.require('diagnose')
     run.require('auto_gates')
+    gates = read(run.path / 'gate_results.json')
+    if run.config.get('semantic_run'):
+        # A masked SfM experiment must not inherit the provisional pre-mask partition.
+        path = run.path / 'split.json'
+        write(path, {'schema_version': 1, 'status': 'not_proposed', 'unit': 'panorama',
+                     'train': None, 'validation': None, 'test': None,
+                     'reason': 'Deterministic spatial partition (AUTO-05) not implemented; '
+                               'the provisional pre-mask split is not reused',
+                     'research_training': gates['permissions']['research_training'],
+                     'proposed_at': None, 'frozen_at': None})
+        return [path]
     expected = [p.stem for p in run.sources]
     proposed = {'train': ['R0010004', 'R0010005', 'R0010006', 'R0010008', 'R0010009',
                           'R0010010', 'R0010012', 'R0010013', 'R0010015', 'R0010016'],
@@ -383,7 +410,6 @@ def partition(run):
     if sorted(assigned) != sorted(expected):
         raise RuntimeError('Proposed panorama partition does not cover the input exactly')
     quality = read(run.path / 'quality.json')
-    gates = read(run.path / 'gate_results.json')
     can_freeze = gates['permissions']['research_training'] == 'PASS'
     split = {'schema_version': 1, 'status': 'frozen' if can_freeze else 'provisional', 'unit': 'panorama',
              'protocol': 'strict_holdout', 'poses': 'exploratory_all_input',
@@ -406,22 +432,58 @@ def auto_gates(run):
     registered_pass = quality['registered_unique_panoramas'] == quality['input_panoramas']
     gates = [
         {'name': 'source_audit', 'result': 'PASS', 'evidence': 'audit completed'},
-        {'name': 'semantic_masks', 'result': 'PASS' if masks['accepted_masks'] else 'UNKNOWN',
+        {'name': 'semantic_masks', 'result': 'PASS' if masks['accepted_masks'] else
+         'FAIL' if masks.get('status') == 'REJECTED' else 'UNKNOWN',
          'evidence': masks['next_action']},
         {'name': 'pose_registration', 'result': 'PASS' if registered_pass else 'FAIL',
          'evidence': f"{quality['registered_unique_panoramas']}/{quality['input_panoramas']} panoramas registered"},
         {'name': 'navigation_segments', 'result': 'UNKNOWN',
          'evidence': quality['center_path']['review_reason']},
     ]
+    extra = semantic_gates(run, masks, quality)
+    # Partition freeze and gsplat stay blocked until every segmentation gate passes.
+    training = all(g['result'] == 'PASS' for g in gates[:3] + extra)
+    gates += extra
     permissions = {
         'panorama_delivery': 'PASS',
-        'research_training': 'PASS' if all(g['result'] == 'PASS' for g in gates[:3]) else 'UNKNOWN',
+        'research_training': 'PASS' if training else 'UNKNOWN',
         'guided_3d_navigation': 'UNKNOWN', 'free_3d_navigation': 'UNKNOWN',
         'product_delivery': 'UNKNOWN'}
     path = run.path / 'gate_results.json'
     write(path, {'schema_version': 1, 'decision': 'accept_restricted',
                  'decision_reason': 'Unknown controls restrict permissions without requesting recapture',
                  'gates': gates, 'permissions': permissions,
+                 'gsplat_allowed': permissions['research_training'] == 'PASS',
                  'unknown_policy': 'No UNKNOWN permission is accepted as PASS',
                  'recapture_required': False})
     return [path]
+
+
+def semantic_gates(run, masks, quality):
+    """Preconditions for freezing the partition and launching gsplat."""
+    names = ('semantic_all_panoramas', 'glass_mirror_multiview',
+             'unknown_glass_constraints_recorded', 'validation_hashes')
+    if masks.get('backend') != 'sam3':
+        return [{'name': n, 'result': 'UNKNOWN', 'evidence': 'SAM 3 backend not configured'}
+                for n in names]
+    processed = [p for p in masks['panoramas'] if p['status'] == 'OK']
+    multiview = masks['multiview_panoramas']
+    navigation = read(run.path / 'navigation_constraints.json')
+    # Recorded, not validated: guided/free navigation permissions stay UNKNOWN.
+    propagated = ({p['panorama_id'] for p in navigation['panoramas']
+                   if p['labels'] or p['all_pixels_unknown']}
+                  if navigation.get('status') == 'advisory' and not navigation['navigation_validated']
+                  else set())
+    hashed = read(run.path / 'mask_provenance.json')['model_and_code_hashed']
+    return [
+        {'name': names[0], 'result': 'PASS' if len(processed) == quality['input_panoramas'] else 'FAIL',
+         'evidence': f"{len(processed)}/{quality['input_panoramas']} panoramas segmented without failure"},
+        {'name': names[1], 'result': 'PASS' if all(len(v) >= 2 for v in multiview.values()) else 'FAIL',
+         'evidence': {g: f'{len(v)} panoramas' for g, v in multiview.items()}},
+        {'name': names[2], 'result': 'PASS' if propagated == {p.stem for p in run.sources} else 'FAIL',
+         'evidence': f"advisory constraints, consumed_by={navigation['consumed_by']}; "
+                     'navigation not validated'},
+        {'name': names[3], 'result': 'PASS' if hashed else 'FAIL',
+         'evidence': 'clean git commit, checkpoint SHA-256, qualified GPU environment and '
+                     'code digests in mask_provenance.json'},
+    ]
