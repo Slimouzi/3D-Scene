@@ -106,21 +106,72 @@ class SplitTests(unittest.TestCase):
         for key in ('guided_3d_navigation', 'free_3d_navigation', 'product_delivery'):
             self.assertEqual(granted[key], 'UNKNOWN')
 
+    def manifest(self, tracks, root=Path('/runs')):
+        images, masks = split.expected_train_files(self.sets, views(CENTERS), 'sfm-run', 'sem-run')
+        recorded = {rel: 'd' * 64 for _, rel in images} | {rel: 'd' * 64 for rel in masks.values()}
+        return split.train_inputs(self.sets, views(CENTERS), tracks, 'sfm-run', 'sem-run', root, recorded)
+
+    def separation(self, inputs, tracks):
+        return {c['name']: c['result'] for c in
+                split.separation_checks(self.sets, inputs, views(CENTERS), tracks, 'sfm-run', 'sem-run')}
+
     def test_training_inputs_contain_no_heldout_data(self):
         held = self.sets['validation'] + self.sets['test']
         train = self.sets['train']
         tracks = {1: [train[0], train[1]], 2: [train[0], held[0]], 3: [held[0], held[1]], 4: [held[2]]}
-        inputs = split.train_inputs(self.sets, views(CENTERS), tracks, 'sfm-run', 'sem-run')
+        inputs = self.manifest(tracks)
         self.assertEqual(inputs['init_points']['excluded_heldout_only_point_ids'], [3, 4])
         self.assertEqual(inputs['init_points']['eligible_point_ids'], [1, 2])
-        self.assertFalse(any(h in image for image in inputs['images'] for h in held))
-        checks = split.separation_checks(self.sets, inputs, views(CENTERS), tracks)
-        self.assertEqual({c['result'] for c in checks}, {'PASS'})
-        leaked = {**inputs, 'images': inputs['images'] + [f'prepare/images/pano_camera0/{held[0]}.png'],
-                  'init_points': {**inputs['init_points'], 'eligible_point_ids': [1, 2, 3]}}
-        results = {c['name']: c['result'] for c in split.separation_checks(self.sets, leaked, views(CENTERS), tracks)}
-        self.assertEqual(results['train_images_exclude_heldout'], 'FAIL')
-        self.assertEqual(results['init_points_have_train_support'], 'FAIL')
+        self.assertFalse(any(h in e['path'] for e in inputs['images'] for h in held))
+        self.assertTrue(all(e['sha256'] and e['resolved'].startswith('/') for e in inputs['images']))
+        self.assertEqual(set(self.separation(inputs, tracks).values()), {'PASS'})
+
+    def test_separation_rejects_forged_manifests(self):
+        train, held = self.sets['train'], self.sets['validation'] + self.sets['test']
+        tracks = {1: [train[0]], 2: [held[0]]}
+        inputs = self.manifest(tracks)
+        unknown_image = {**inputs, 'images': inputs['images'] + [
+            {'panorama_id': train[0], 'path': 'elsewhere/unknown.png', 'resolved': '/x', 'sha256': 'd' * 64}]}
+        self.assertEqual(self.separation(unknown_image, tracks)['train_images_exact'], 'FAIL')
+        heldout_image = {**inputs, 'images': inputs['images'][1:] + [
+            {**inputs['images'][0], 'path': f'sfm-run/prepare/images/pano_camera0/{held[0]}.png'}]}
+        self.assertEqual(self.separation(heldout_image, tracks)['train_images_exact'], 'FAIL')
+        swapped_mask = {**inputs, 'masks': {**inputs['masks'], train[0]: {
+            **inputs['masks'][train[0]], 'path': f'sem-run/segmentation/fused/{held[0]}/appearance_mask.png'}}}
+        self.assertEqual(self.separation(swapped_mask, tracks)['train_masks_match_panoramas'], 'FAIL')
+        extra_mask = {**inputs, 'masks': {**inputs['masks'], held[0]: inputs['masks'][train[0]]}}
+        self.assertEqual(self.separation(extra_mask, tracks)['train_masks_match_panoramas'], 'FAIL')
+        no_init = {**inputs, 'init_points': {**inputs['init_points'], 'eligible_point_ids': []}}
+        self.assertEqual(self.separation(no_init, tracks)['init_points_have_train_support'], 'FAIL')
+        empty = self.manifest({2: [held[0]]})        # every point is held-out only
+        self.assertEqual(self.separation(empty, {2: [held[0]]})['init_points_have_train_support'], 'FAIL')
+        unknown_point = {**inputs, 'init_points': {**inputs['init_points'], 'eligible_point_ids': [1, 99]}}
+        self.assertEqual(self.separation(unknown_point, tracks)['init_points_have_train_support'], 'FAIL')
+        self.assertEqual(self.separation({}, tracks)['train_images_exact'], 'FAIL')
+
+    def test_training_files_verified_by_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            from theta_pipeline.storage import digest
+            images, masks = split.expected_train_files(self.sets, views(CENTERS), 'sfm-run', 'sem-run')
+            recorded = {}
+            for rel in [r for _, r in images] + list(masks.values()):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_bytes(rel.encode())
+                recorded[rel] = digest(root / rel)
+            inputs = split.train_inputs(self.sets, views(CENTERS), {1: self.sets['train'][:1]},
+                                        'sfm-run', 'sem-run', root, recorded)
+            self.assertEqual(split.verify_train_files(inputs, root)['result'], 'PASS')
+            (root / images[0][1]).write_bytes(b'modified')
+            result = split.verify_train_files(inputs, root)
+            self.assertEqual(result['result'], 'FAIL')
+            self.assertEqual(result['evidence']['changed'], [images[0][1]])
+            (root / images[0][1]).unlink()
+            self.assertEqual(split.verify_train_files(inputs, root)['evidence']['missing'], [images[0][1]])
+            unrecorded = split.train_inputs(self.sets, views(CENTERS), {1: self.sets['train'][:1]},
+                                            'sfm-run', 'sem-run', root, {})
+            self.assertEqual(split.verify_train_files(unrecorded, root)['result'], 'FAIL')
+            self.assertEqual(split.verify_train_files({}, root)['result'], 'FAIL')
 
     def test_layout_and_hash_are_canonical(self):
         reordered = {n: list(reversed(self.sets[n])) for n in split.SETS}
@@ -161,6 +212,9 @@ class SplitExperimentTests(unittest.TestCase):
             mask.parent.mkdir(parents=True)
             Image.fromarray(np.full((64, 128), 255, np.uint8)).save(mask)
             manifests[str(mask.relative_to(sem))] = digest(mask)
+            appearance = mask.with_name('appearance_mask.png')
+            Image.fromarray(np.full((64, 128), 255, np.uint8)).save(appearance)
+            manifests[str(appearance.relative_to(sem))] = digest(appearance)
             panoramas.append({'panorama_id': pano, 'artifacts': {'geometry_mask': str(mask.relative_to(sem))}})
         for name in ('mask_consistency.json', 'mask_provenance.json', 'navigation_constraints.json'):
             write(sem / name, {'schema_version': 1})
@@ -176,6 +230,9 @@ class SplitExperimentTests(unittest.TestCase):
                                               'center_world': c} for p, c in CENTERS.items()]})
         write(sfm / 'quality.json', {'largest_component': 0, 'j1_passed': False})
         write(sfm / 'views.json', {'views': views(CENTERS)})
+        for view in views(CENTERS):
+            (sfm / view['image']).parent.mkdir(parents=True, exist_ok=True)
+            (sfm / view['image']).write_bytes(view['image'].encode())
         write(sfm / 'sfm/matches.json', {'edges': [{'source': a, 'target': b, 'inlier_observations': 50}
                                                    for a, b in neighbour_edges(CENTERS)]})
         (sfm / 'sfm/sparse/0').mkdir(parents=True)
@@ -185,7 +242,7 @@ class SplitExperimentTests(unittest.TestCase):
         inputs = {p.name: digest(p) for p in sorted((root / 'input').iterdir())}
         write(sfm / 'run.json', {'fingerprint': 'f' * 64, 'provenance': {
             'semantic_run': {'run': 'sem', 'semantic_masks_sha256': self.sem_digest}, 'inputs': inputs},
-            'stages': {'diagnose': art('poses.json', 'quality.json'), 'prepare': art('views.json'),
+            'stages': {'diagnose': art('poses.json', 'quality.json'), 'prepare': art('views.json', *[v['image'] for v in views(CENTERS)]),
                        'matching': art('sfm/matches.json'), 'mapping': art('sfm/sparse/0/points3D.bin')}})
         self.config = root / 'split.json'
         write(self.config, {**base, 'semantic_run': 'sem', 'sfm_run': 'sfm', 'split': {}})
@@ -222,7 +279,9 @@ class SplitExperimentTests(unittest.TestCase):
             self.assertEqual(gates['permissions']['guided_3d_navigation'], 'UNKNOWN')
             inputs = read(run.path / 'train_inputs.json')
             held = record['validation'] + record['test']
-            self.assertFalse(any(h in i for i in inputs['images'] for h in held))
+            self.assertFalse(any(h in e['path'] for e in inputs['images'] for h in held))
+            self.assertEqual(len(inputs['images']), 12 * len(record['train']))
+            self.assertTrue(all(len(e['sha256']) == 64 for e in [*inputs['images'], *inputs['masks'].values()]))
             heldout_only = [pid for pid, panos in self.tracks.items() if not set(panos) & set(record['train'])]
             self.assertEqual(inputs['init_points']['excluded_heldout_only_point_ids'], heldout_only)
             report = (run.path / 'split_report.md').read_text()
@@ -244,6 +303,23 @@ class SplitExperimentTests(unittest.TestCase):
             gates = read(run.path / 'gate_results.json')
             self.assertFalse(gates['gsplat_allowed']['evaluated'])
             self.assertTrue(gates['gsplat_allowed']['exploratory'])
+
+    def test_training_file_modified_after_split_blocks_evaluated_training(self):
+        from theta_pipeline import stages
+        from theta_pipeline.storage import Run
+        with Run(self.config, 'late').locked() as run:
+            run.stage('audit', stages.audit)
+            run.stage('auto_mask', stages.auto_mask, requires=('audit',))
+            run.stage('import_sfm', split.import_sfm, requires=('audit',))
+            run.stage('auto_split', split.auto_split, requires=('auto_mask', 'import_sfm'))
+            self.assertEqual(read(run.path / 'split.json')['status'], 'frozen')
+            image = read(run.path / 'train_inputs.json')['images'][0]['path']
+            (self.root / 'runs' / image).write_bytes(b'modified after freeze')
+            run.stage('split_gates', split.split_gates, requires=('auto_split',))
+            gates = read(run.path / 'gate_results.json')
+            self.assertFalse(gates['gsplat_allowed']['evaluated'])
+            intact = {g['name']: g for g in gates['gates']}['train_files_intact']
+            self.assertEqual(intact['evidence']['changed'], [image])
 
     def test_modified_source_run_is_refused(self):
         from theta_pipeline.storage import Run

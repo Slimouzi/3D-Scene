@@ -83,7 +83,9 @@ Artefacts : `split.json` (ensembles, méthode `auto05-hull-maxmin-v1`, paramètr
 - Unité : le panorama ; toutes ses faces suivent son ensemble.
 - Les sommets de l’enveloppe convexe des centres restent en entraînement ; chaque panorama réservé doit avoir au moins 2 stations d’entraînement parmi ses 4 plus proches voisins, être intérieur à l’enveloppe d’entraînement et covisible avec elle ; le graphe de covisibilité de l’entraînement reste connexe. Sinon : `unknown`.
 - Statuts : `frozen` (tous les contrôles PASS, commit propre), `rejected` (un contrôle FAIL), `unknown` (données incompatibles).
-- Une fois validée, recopier `partition_sha256` dans `split.expected_partition_sha256` : toute partition recalculée différente sera alors `rejected`.
+- Une fois validée, enregistrer `partition_sha256` dans une **nouvelle** configuration versionnée (`split.expected_partition_sha256`) pour l’expérience suivante, sans modifier celle du run déjà créé : toute partition recalculée différente sera alors `rejected`.
+- `train_inputs.json` liste la liste exacte attendue des images et masques d’apparence d’entraînement, avec chemin relatif, chemin résolu et SHA-256 enregistré par le run source. `split.verify_train_files` vérifie existence et intégrité à la partition, aux gates, et doit être rappelée au lancement de l’entraînement. Une initialisation vide est un FAIL.
+- Le recalcul des couleurs des points depuis les seules vues d’entraînement n’est pas encore exécuté : l’adaptateur gsplat devra l’appliquer et le tester.
 - `gsplat_allowed.exploratory` : masques acceptés et poses disponibles ; aucune métrique réservée. `gsplat_allowed.evaluated` : en plus, partition figée revalidée et séparation des données vérifiée.
 - Les poses des vues réservées proviennent du SfM conjoint sur les 13 panoramas ; le rapport le déclare. `j1_passed`, navigation et livraison produit restent inchangés / UNKNOWN.
 

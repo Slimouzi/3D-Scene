@@ -222,35 +222,79 @@ def heldout_only_points(tracks, train):
     return sorted(pid for pid, panos in tracks.items() if not set(panos) & set(train))
 
 
-def train_inputs(sets, views, tracks, source, semantic_run):
+def expected_train_files(sets, views, sfm_run, semantic_run):
+    """The exact training files: every face image and the appearance mask of each train panorama."""
     train = set(sets['train'])
-    images = [v['image'] for v in views if v['panorama_id'] in train]
-    excluded = heldout_only_points(tracks, train)
-    return {'schema_version': 1, 'panoramas': sorted(train),
-            'images': sorted(images), 'images_root': source,
-            'masks': {p: f'{semantic_run}/segmentation/fused/{p}/appearance_mask.png' for p in sorted(train)},
+    images = sorted((v['panorama_id'], f"{sfm_run}/{v['image']}") for v in views if v['panorama_id'] in train)
+    masks = {p: f'{semantic_run}/segmentation/fused/{p}/appearance_mask.png' for p in sorted(train)}
+    return images, masks
+
+
+def recorded_digests(output_root, run_name, stage):
+    """SHA-256 recorded by a source run for its completed stage artifacts, keyed by output path."""
+    entry = read(output_root / run_name / 'run.json')['stages'].get(stage, {})
+    if entry.get('status') != 'completed':
+        return {}
+    return {f'{run_name}/{rel}': sha for rel, sha in entry['artifacts'].items()}
+
+
+def file_record(output_root, rel, recorded):
+    return {'path': rel, 'resolved': str((output_root / rel).resolve()), 'sha256': recorded.get(rel)}
+
+
+def train_inputs(sets, views, tracks, sfm_run, semantic_run, output_root, recorded):
+    images, masks = expected_train_files(sets, views, sfm_run, semantic_run)
+    excluded = heldout_only_points(tracks, sets['train'])
+    return {'schema_version': 2, 'panoramas': sorted(sets['train']),
+            'sfm_run': sfm_run, 'semantic_run': semantic_run,
+            'paths_relative_to': 'the runs output directory',
+            'images': [{'panorama_id': p, **file_record(output_root, rel, recorded)} for p, rel in images],
+            'masks': {p: file_record(output_root, rel, recorded) for p, rel in masks.items()},
             'init_points': {
                 'eligible_point_ids': sorted(set(tracks) - set(excluded)),
                 'excluded_heldout_only_point_ids': excluded,
+                'empty_policy': 'an empty eligible set is FAIL: no random or untraceable initialization',
                 'positions': 'triangulated by the masked SfM with all 13 panoramas: held-out '
                              'stations contributed to camera and point estimation (transductive)',
-                'colors': 'must be recomputed from train observations only; SfM colors may '
-                          'include held-out observations'}}
+                'colors': 'NOT YET RECOMPUTED. The gsplat adapter must recompute colors from train '
+                          'observations only, and test it, before claiming color separation.'}}
 
 
-def separation_checks(sets, inputs, views, tracks):
-    held = set(sets['validation']) | set(sets['test'])
-    held_images = {v['image'] for v in views if v['panorama_id'] in held}
-    eligible = inputs['init_points']['eligible_point_ids']
+def verify_train_files(inputs, output_root):
+    """Existence and SHA-256 of every training file. Must run again when training starts."""
+    entries = [*(inputs.get('images') or []), *(inputs.get('masks') or {}).values()]
+    missing = [e['path'] for e in entries if not (Path(output_root) / e['path']).is_file()]
+    unrecorded = [e['path'] for e in entries if not e.get('sha256')]
+    changed = [e['path'] for e in entries if e['path'] not in missing and e.get('sha256')
+               and digest(Path(output_root) / e['path']) != e['sha256']]
+    return check('train_files_intact', bool(entries) and not (missing or unrecorded or changed),
+                 {'files': len(entries), 'missing': missing, 'unrecorded': unrecorded, 'changed': changed})
+
+
+def separation_checks(sets, inputs, views, tracks, sfm_run, semantic_run):
+    """Validate the manifest content against what the frozen sets imply, not its own claims."""
+    expected_images, expected_masks = expected_train_files(sets, views, sfm_run, semantic_run)
+    images = sorted((e['panorama_id'], e['path']) for e in inputs.get('images') or [])
+    masks = {p: e['path'] for p, e in (inputs.get('masks') or {}).items()}
+    init = inputs.get('init_points') or {}
+    eligible = init.get('eligible_point_ids') or []
+    excluded = init.get('excluded_heldout_only_point_ids') or []
+    train = set(sets['train'])
+    support = bool(eligible) and all(pid in tracks and set(tracks[pid]) & train for pid in eligible)
+    partition = (not set(eligible) & set(excluded) and set(eligible) | set(excluded) == set(tracks)
+                 and sorted(excluded) == heldout_only_points(tracks, train))
+    wrong_masks = sorted(p for p in set(masks) | set(expected_masks) if masks.get(p) != expected_masks.get(p))
     return [
-        check('train_images_exclude_heldout', not set(inputs['images']) & held_images
-              and set(inputs['panoramas']) == set(sets['train']),
-              f"{len(inputs['images'])} train images, none from {sorted(held)}"),
-        check('train_masks_exclude_heldout', not set(inputs['masks']) & held, 'appearance masks of train only'),
-        check('init_points_have_train_support',
-              all(set(tracks[pid]) & set(sets['train']) for pid in eligible),
-              f"{len(eligible)} eligible points, {len(inputs['init_points']['excluded_heldout_only_point_ids'])} "
-              'held-out-only points excluded'),
+        check('train_panoramas_exact', inputs.get('panoramas') == sorted(train), inputs.get('panoramas')),
+        check('train_images_exact', images == expected_images and len(images) == len(set(images)),
+              {'expected': len(expected_images), 'listed': len(images),
+               'unexpected': sorted(set(images) - set(expected_images))[:20],
+               'missing': sorted(set(expected_images) - set(images))[:20]}),
+        check('train_masks_match_panoramas', not wrong_masks,
+              {'expected': len(expected_masks), 'mismatched': wrong_masks}),
+        check('init_points_have_train_support', support and partition,
+              {'eligible': len(eligible), 'excluded_heldout_only': len(excluded),
+               'empty': not eligible, 'consistent_with_tracks': partition}),
     ]
 
 
@@ -350,10 +394,15 @@ def auto_split(run):
         split['face_assignment'] = face_assignment(sets, views)
         component = read(target / 'sfm_import.json')['component']
         tracks = tracks_from_model(target / f'sfm/sparse/{component}')
-        inputs = train_inputs(sets, views, tracks, f"{run.config['sfm_run']}", run.config['semantic_run'])
+        sfm_run, semantic_run = run.config['sfm_run'], run.config['semantic_run']
+        output_root = run.path.parent
+        recorded = {**recorded_digests(output_root, sfm_run, 'prepare'),
+                    **recorded_digests(output_root, semantic_run, 'auto_mask')}
+        inputs = train_inputs(sets, views, tracks, sfm_run, semantic_run, output_root, recorded)
         write(inputs_path, inputs)
         checks += validate(split, expected, poses_sha256, views)
-        checks += separation_checks(sets, inputs, views, tracks)
+        checks += separation_checks(sets, inputs, views, tracks, sfm_run, semantic_run)
+        checks.append(verify_train_files(inputs, output_root))
         pinned = p['expected_partition_sha256']
         checks.append(check('matches_pinned_partition', pinned is None or pinned == split['partition_sha256'],
                             {'pinned': pinned, 'computed': split['partition_sha256']}))
@@ -379,7 +428,8 @@ PROTOCOL = {
              'test stations took part in camera and point estimation (transductive poses).',
     'training_losses': 'train panoramas only; no validation or test image in any loss',
     'initialization': 'SfM points with at least one train observation; points seen only from '
-                      'validation/test are excluded; colors recomputed from train views',
+                      'validation/test are excluded; colors to be recomputed from train views by the '
+                      'gsplat adapter (not yet executed)',
     'validation': 'parameter and checkpoint selection only',
     'test': 'reserved for the final evaluation; never used for selection',
     'metrics': 'no quality threshold is defined; metrics are reported, not judged',
@@ -418,9 +468,14 @@ def split_gates(run):
     if split['status'] == 'frozen':
         # Re-validated now: a frozen partition cannot change silently.
         current = validate(split, expected, poses_sha256, views)
-        separation = [c for c in split['checks'] if c['name'] in
-                      ('train_images_exclude_heldout', 'train_masks_exclude_heldout',
-                       'init_points_have_train_support')]
+        # Manifest content and training files are re-verified now, not trusted from auto_split.
+        inputs = read(run.path / 'train_inputs.json')
+        component = read(run.path / 'sfm_import/sfm_import.json')['component']
+        tracks = tracks_from_model(run.path / f'sfm_import/sfm/sparse/{component}')
+        sets = {name: split[name] for name in SETS}
+        separation = separation_checks(sets, inputs, views, tracks,
+                                       run.config['sfm_run'], run.config['semantic_run'])
+        separation.append(verify_train_files(inputs, run.path.parent))
     else:
         current = [check('partition_frozen', False, f"split status {split['status']}",
                          unknown=split['status'] == 'unknown')]
@@ -438,7 +493,10 @@ def split_gates(run):
                  'j1_passed': quality['j1_passed'],
                  'unknown_policy': 'No UNKNOWN permission is accepted as PASS',
                  'exploratory_definition': 'may use all 13 panoramas; no held-out metric may be reported',
-                 'evaluated_definition': 'frozen AUTO-05 partition; train-only losses and initialization'})
+                 'evaluated_definition': 'frozen AUTO-05 partition; train-only losses and initialization',
+                 'pending_before_training': [
+                     'training launcher must call split.verify_train_files again before reading inputs',
+                     'gsplat adapter must recompute point colors from train observations and test it']})
     return [path]
 
 
