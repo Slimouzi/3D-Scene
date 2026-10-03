@@ -267,6 +267,101 @@ class SegmentationTests(unittest.TestCase):
         mask[4, 0] = True
         self.assertTrue(fusion.wrap_dilate(mask, 1)[4, -1])
 
+    @staticmethod
+    def cap(width, lon_deg, lat_deg, radius_deg):
+        d = fusion.erp_directions(width)
+        lon, lat = np.deg2rad(lon_deg), np.deg2rad(lat_deg)
+        center = np.array([np.cos(lat) * np.sin(lon), np.sin(lat), np.cos(lat) * np.cos(lon)])
+        return d @ center > np.cos(np.deg2rad(radius_deg))
+
+    def test_seam_continuous_mask_crossing_seam_passes(self):
+        # Pointwise mask spanning the seam: identical on both sides up to discretization.
+        mask = self.cap(2048, 180, 30, 25)
+        self.assertTrue(mask[:, 0].any() and mask[:, -1].any())
+        result = fusion.seam_continuity(mask)
+        self.assertTrue(result['passed'], result)
+
+    def test_seam_r0010009_equivalent_boundary_near_seam_passes(self):
+        # A region whose lateral edge lies ~1 degree from the seam reproduces the
+        # R0010009 observation (0.0458 > 0.02 with the former raw metric).
+        mask = self.cap(2048, 161, 10, 20)
+        result = fusion.seam_continuity(mask)
+        self.assertGreater(result['seam_mismatch'], POLICY['max_seam_mismatch'])
+        self.assertAlmostEqual(result['seam_mismatch'], .0458, delta=.01)
+        self.assertGreaterEqual(result['reference_max'], result['seam_mismatch'])
+        self.assertTrue(result['passed'], result)
+        self.assertEqual(result['threshold'], POLICY['max_seam_mismatch'])
+
+    def test_seam_cut_mask_fails(self):
+        mask = np.zeros((1024, 2048), bool)
+        mask[300:700, :200] = True     # stops dead at column 0, nothing at column W-1
+        result = fusion.seam_continuity(mask)
+        self.assertEqual(result['seam_mismatch'], 1.)
+        self.assertFalse(result['passed'])
+
+    def test_components_and_holes_wrap_across_seam(self):
+        ring = np.zeros((64, 128), bool)
+        ring[20:40, :10] = ring[20:40, -10:] = True
+        ring[25:35, :5] = ring[25:35, -5:] = False        # hole straddling the seam
+        holes = fusion.enclosed_holes(ring)
+        self.assertTrue(holes[30, 0] and holes[30, -1])
+        candidates = np.zeros((64, 128), bool)
+        candidates[10:20, :6] = candidates[10:20, -6:] = True
+        seeds = np.zeros_like(candidates)
+        seeds[15, 2] = True
+        self.assertTrue(fusion.connected_to(candidates, seeds)[15, -2])
+
+    def test_fusion_is_roll_invariant_and_detects_non_circular_processing(self):
+        width = 512
+        observers = np.full((width // 2, width), 4, np.uint8)
+        votes = {g: np.zeros_like(observers) for g in fusion.GROUPS}
+        glass = self.cap(width, 180, 0, 20)
+        votes['glass'][glass] = 3
+        votes['reflection'][self.cap(width, 180, 0, 26) & ~glass] = 1
+        votes['glass'][self.cap(width, 180, 0, 6)] = 0      # pane interior: an enclosed hole
+        decision = fusion.decide(observers, votes)
+        masks = fusion.output_masks(decision, width)
+        self.assertTrue(decision['holes'].any())
+        self.assertEqual(fusion.seam_check(observers, votes, decision, masks)['result'], 'PASS')
+
+        def flat_holes(mask):     # former non-circular behaviour: seam columns as outside
+            import cv2
+            _, labels = cv2.connectedComponents((~mask).astype(np.uint8), connectivity=4)
+            outside = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
+            return ~mask & ~np.isin(labels, outside)
+        original = fusion.enclosed_holes
+        fusion.enclosed_holes = flat_holes
+        try:
+            decision = fusion.decide(observers, votes)
+            masks = fusion.output_masks(decision, width)
+            result = fusion.seam_check(observers, votes, decision, masks)
+        finally:
+            fusion.enclosed_holes = original
+        self.assertEqual(result['result'], 'FAIL')
+        self.assertFalse(result['evidence']['roll_invariant'])
+
+    def test_seam_failure_rejects_semantic_masks(self):
+        with Run(self.config, 'seam').locked() as run:
+            faces = self.prepared(run)
+            self.segment(run, faces, 'a')
+            run.stage('seg_trial', stages.seg_trial, requires=('seg_faces',))
+            self.segment(run, faces, 'b')
+            original = fusion.seam_continuity
+            fusion.seam_continuity = lambda mask: {**original(mask), 'passed': False}
+            try:
+                run.stage('auto_mask', stages.auto_mask, requires=('seg_trial',))
+            finally:
+                fusion.seam_continuity = original
+            masks = read(run.path / 'semantic_masks.json')
+            self.assertEqual(masks['status'], 'REJECTED')
+            self.assertFalse(masks['accepted_masks'])
+            seam = {c['name']: c for c in read(run.path / 'mask_consistency.json')
+                    ['panoramas']['a']['checks']}['seam_discontinuity']
+            self.assertEqual(seam['result'], 'FAIL')
+            observed = seam['evidence']['masks']['reflective_candidate']
+            self.assertIn('seam_mismatch', observed)
+            self.assertEqual(observed['threshold'], POLICY['max_seam_mismatch'])
+
     def test_erp_directions_invert_projection(self):
         from theta_pipeline.geometry import erp_coordinates
         d = fusion.erp_directions(64)

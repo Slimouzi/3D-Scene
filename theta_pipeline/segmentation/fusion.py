@@ -84,11 +84,33 @@ def wrap_dilate(mask, radius):
     return cv2.dilate(padded, kernel)[radius:-radius, radius:-radius].astype(bool)
 
 
+def wrap_labels(mask, connectivity):
+    """Connected components on the ERP cylinder: columns 0 and W-1 are neighbours."""
+    count, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=connectivity)
+    parent = np.arange(count)
+
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    left, right = labels[:, 0], labels[:, -1]
+    pairs = [(left, right)]
+    if connectivity == 8:
+        pairs += [(left[1:], right[:-1]), (left[:-1], right[1:])]
+    for a, b in pairs:
+        both = (a > 0) & (b > 0)
+        for x, y in set(zip(a[both].tolist(), b[both].tolist())):
+            parent[root(x)] = root(y)
+    return np.array([root(i) for i in range(count)])[labels]
+
+
 def enclosed_holes(mask):
+    """Non-mask regions enclosed by the mask. Only the poles (first/last rows) are outside."""
     if not mask.any():
         return np.zeros_like(mask)
-    _, labels = cv2.connectedComponents((~mask).astype(np.uint8), connectivity=4)
-    outside = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
+    labels = wrap_labels(~mask, 4)
+    outside = np.unique(np.concatenate((labels[0], labels[-1])))
     return ~mask & ~np.isin(labels, outside)
 
 
@@ -96,7 +118,7 @@ def connected_to(candidates, seeds):
     """Candidate components touching a seed pixel."""
     if not (candidates & seeds).any():
         return np.zeros_like(candidates)
-    _, labels = cv2.connectedComponents(candidates.astype(np.uint8), connectivity=8)
+    labels = wrap_labels(candidates, 8)
     touched = np.unique(labels[candidates & seeds])
     return candidates & np.isin(labels, touched)
 
@@ -193,6 +215,41 @@ def output_masks(decision, width):
             'unknown_mask': decision['unknown'].astype(np.uint8) * 255}
 
 
+def seam_continuity(mask):
+    """Mismatch between columns W-1 and 0, judged against adjacent interior column pairs.
+
+    The ERP is circular: columns W-1 and 0 are as close as any adjacent pair, and a
+    pointwise mask crossing the seam mismatches there only where a boundary crosses.
+    A boundary near the seam legitimately gives a large raw rate (its slope), so the
+    seam fails only if it exceeds both the threshold and the worst nearby interior pair
+    by more than the threshold: a mask cut along the seam stays FAIL.
+    """
+    def rate(x, y):
+        either = x | y
+        return float((x != y).sum() / either.sum()) if either.any() else None
+    width, k = mask.shape[1], POLICY['seam_reference_columns']
+    seam = rate(mask[:, -1], mask[:, 0])
+    reference = [r for j in (*range(width - 1 - k, width - 1), *range(k))
+                 if (r := rate(mask[:, j], mask[:, j + 1])) is not None]
+    worst = max(reference) if reference else 0.
+    seam = seam or 0.
+    threshold = POLICY['max_seam_mismatch']
+    return {'seam_mismatch': seam, 'seam_rows': int((mask[:, -1] | mask[:, 0]).sum()),
+            'reference_pairs': len(reference), 'reference_max': worst,
+            'reference_median': float(np.median(reference)) if reference else None,
+            'excess_over_reference': seam - worst, 'threshold': threshold,
+            'passed': seam <= threshold or seam - worst <= threshold}
+
+
+def roll_invariant(observers, votes, decision, masks, width):
+    """Post-processing must commute with a horizontal rotation of the panorama."""
+    shift = width // 2
+    rolled = decide(np.roll(observers, shift, 1), {g: np.roll(v, shift, 1) for g, v in votes.items()})
+    rolled_masks = output_masks(rolled, width)
+    same = all(np.array_equal(np.roll(rolled_masks[k], -shift, 1), masks[k]) for k in masks)
+    return same and np.array_equal(np.roll(rolled['labels'], -shift, 1), decision['labels'])
+
+
 def solid_angle_fraction(mask):
     weights = np.cos(((np.arange(mask.shape[0]) + .5) / mask.shape[0] - .5) * np.pi)
     return float((mask * weights[:, None]).sum() / (weights.sum() * mask.shape[1]))
@@ -203,15 +260,26 @@ def check(name, passed, evidence, unknown=False):
             'evidence': evidence}
 
 
-def panorama_checks(raw, votes, decision, masks, rejected):
+def seam_check(observers, votes, decision, masks):
+    width = decision['labels'].shape[1]
+    seams = {'reflective_candidate': seam_continuity(decision['reflective_candidate']),
+             'geometry_excluded': seam_continuity(masks['geometry_mask'] == 0),
+             'unknown': seam_continuity(masks['unknown_mask'] > 0)}
+    circular = roll_invariant(observers, votes, decision, masks, width)
+    return check('seam_discontinuity', circular and all(v['passed'] for v in seams.values()),
+                 {'roll_invariant': circular, 'masks': seams,
+                  'rule': 'FAIL if post-processing is not roll invariant, or if a seam mismatch '
+                          'exceeds max_seam_mismatch and the worst of the '
+                          f"{POLICY['seam_reference_columns']} adjacent interior pairs on each side "
+                          'by more than max_seam_mismatch'})
+
+
+def panorama_checks(raw, observers, votes, decision, masks, rejected):
     failed = [f['face_id'] for f in raw['faces'] if f['status'] != 'ok']
     glass_votes = votes['glass'][decision['glass']]
     reflective = decision['glass'] | decision['mirror']
     holes = int(decision['holes'].sum())
     hole_fraction = holes / max(int((reflective | decision['holes']).sum()), 1)
-    candidate = decision['reflective_candidate']
-    seam_rows = candidate[:, 0] | candidate[:, -1]
-    seam = float((candidate[:, 0] != candidate[:, -1]).sum() / seam_rows.sum()) if seam_rows.any() else 0.
     reasons = {}
     for r in rejected:
         reasons[r['reason']] = reasons.get(r['reason'], 0) + 1
@@ -226,8 +294,7 @@ def panorama_checks(raw, votes, decision, masks, rejected):
               f'{int(decision["unknown_glass"].sum())} px unknown_glass'),
         check('holes', hole_fraction <= POLICY['max_hole_fraction'],
               f'{holes} enclosed px ({hole_fraction:.4f} of glass/mirror) classified unknown'),
-        check('seam_discontinuity', seam <= POLICY['max_seam_mismatch'],
-              f'{seam:.4f} mismatch across the ERP seam'),
+        seam_check(observers, votes, decision, masks),
         check('no_default_mask', not defaults.any(),
               f'{int(decision["no_inference"].sum())} px without inference, all excluded'),
     ]
@@ -328,7 +395,7 @@ def process(run, panoramas, mask_dir, preview_dir):
                                       'glass_candidate': bool((votes['glass'] > 0).any()),
                                       'mirror_candidate': bool((votes['mirror'] > 0).any())},
                          'metrics': panorama_metrics(observers, votes, decision),
-                         'checks': panorama_checks(raw, votes, decision, masks, rejected)}
+                         'checks': panorama_checks(raw, observers, votes, decision, masks, rejected)}
     return faces, results, outputs
 
 

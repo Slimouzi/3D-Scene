@@ -25,7 +25,7 @@ GROUPS = {
 # Versioned decision rules. Thresholds are NOT calibrated on annotated data yet:
 # every decision derived from them is experimental (CTO/05, section 4).
 POLICY = {
-    'version': 'seg-policy-1',
+    'version': 'seg-policy-2',
     'calibrated': False,
     'confidence_threshold': 0.5,
     'face_border_px': 8,
@@ -44,6 +44,7 @@ POLICY = {
     'appearance_weight_reflective': 128,
     'max_hole_fraction': 0.05,
     'max_seam_mismatch': 0.02,
+    'seam_reference_columns': 16,
     'neighbors': 2,
     'trial': {'min_two_view_coverage': 0.99, 'max_failed_faces': 0,
               'min_pairwise_iou': 0.5, 'max_unknown_fraction': 0.35},
