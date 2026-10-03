@@ -63,10 +63,10 @@ Règles :
 - Jointure ERP traitée comme circulaire (`seg-policy-2`) : composantes connexes et trous raccordés entre les colonnes 0 et W−1 ; le post-traitement doit être invariant par rotation horizontale. Un écart à la jointure n’échoue que s’il dépasse `max_seam_mismatch` à la fois en valeur brute et au-delà de la pire paire de colonnes intérieures voisines (16 de chaque côté) : un bord de région proche de la jointure passe, un masque coupé à la jointure reste FAIL. `mask_consistency.json` conserve la valeur observée, la référence et le seuil. Diagnostic en lecture seule d’un run existant : `python scripts/seam_diagnostic.py Output/runs/<id> <panorama>`.
 - Seuils `POLICY` non calibrés.
 
-Après une segmentation des 13 panoramas `ACCEPTED`, lancer une nouvelle expérience SfM masquée : `configs/salon-masked.json` (`"semantic_run": "salon-sam3-001"`) injecte les `geometry_mask` vérifiés dans `prepare`. La partition provisoire précédente n’est pas réutilisée (`split.json` : `not_proposed` jusqu’à l’algorithme AUTO-05).
+Après une segmentation des 13 panoramas `ACCEPTED`, lancer une nouvelle expérience SfM masquée : `configs/salon-masked.json` (`"semantic_run": "salon-sam3-002"`) injecte les `geometry_mask` vérifiés dans `prepare`. La partition provisoire précédente n’est pas réutilisée (`split.json` : `not_proposed` jusqu’à l’algorithme AUTO-05).
 
 ```sh
-.venv-sfm/bin/python -m theta_pipeline diagnostic --config configs/salon-masked.json --run-id salon-masked-001
+.venv-sfm/bin/python -m theta_pipeline diagnostic --config configs/salon-masked.json --run-id salon-masked-003
 ```
 
 ## Reproduire l’audit

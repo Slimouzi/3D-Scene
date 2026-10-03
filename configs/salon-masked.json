@@ -10,5 +10,5 @@
   "mapping_max_seconds": 600,
   "masks": {},
   "auto_mask_backend": "sam3",
-  "semantic_run": "salon-sam3-001"
+  "semantic_run": "salon-sam3-002"
 }
