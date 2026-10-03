@@ -89,6 +89,30 @@ Artefacts : `split.json` (ensembles, méthode `auto05-hull-maxmin-v1`, paramètr
 - `gsplat_allowed.exploratory` : masques acceptés et poses disponibles ; aucune métrique réservée. `gsplat_allowed.evaluated` : en plus, partition figée revalidée et séparation des données vérifiée.
 - Les poses des vues réservées proviennent du SfM conjoint sur les 13 panoramas ; le rapport le déclare. `j1_passed`, navigation et livraison produit restent inchangés / UNKNOWN.
 
+## Entraînement gsplat évalué
+
+Autorisation : entraînement de recherche évalué selon le protocole AUTO-05. Limite déclarée dans chaque manifeste : poses et positions initiales viennent du SfM masqué conjoint des 13 panoramas, vues réservées comprises. Navigation et livraison produit : non validées.
+
+- `configs/salon-gsplat.json` fige la partition validée de `salon-split-005` (`expected_partition_sha256 = 3949e717…aaae`). Les runs `salon-sam3-002`, `salon-masked-003` et `salon-split-005` sont seulement lus et vérifiés.
+- `gsplat-prepare` (environnement CPU) revalide la partition, la séparation et les fichiers, puis écrit `gsplat_inputs/` : caméras d’entraînement, de validation et de test dans trois fichiers distincts, poids d’apparence par face, `points.npz` (points admissibles, couleurs recalculées depuis les seules observations d’entraînement).
+- `requirements/gsplat.lock.txt` : environnement séparé (CPython 3.10.22, torch 2.4.1+cu124, gsplat 1.5.3+pt24cu124 précompilé, empreinte de la wheel figée), car gsplat ne publie pas de noyaux précompilés pour torch 2.14 / CUDA 13.
+- `theta_pipeline.gsplat_train` revérifie au démarrage l’environnement, le commit propre et identique à la préparation, la partition, l’autorisation et l’empreinte de chaque fichier lu. Pertes et densification : faces d’entraînement uniquement ; la validation choisit le checkpoint (`selection.json`) ; `evaluate-test --final` évalue le test une seule fois. Aucun seuil de qualité : les métriques sont rapportées.
+- Checkpoints reprenables (`--resume`) : paramètres, optimiseurs, planificateur, état de densification, générateurs aléatoires ; reprise refusée si configuration, entrées, partition ou commit diffèrent. Journaux : `train.jsonl`, `validation.jsonl`, `training.json`.
+
+```sh
+# VM : environnement gsplat
+uv python install 3.10.22
+uv venv --python 3.10.22 .venv-gsplat
+uv pip install --python .venv-gsplat/bin/python --extra-index-url https://download.pytorch.org/whl/cu124 \
+  --index-strategy unsafe-best-match -r requirements/gsplat.lock.txt
+THETA_GSPLAT_GPU=1 .venv-gsplat/bin/python -m unittest -v tests.test_gsplat_gpu
+
+# VM : préparation (CPU), puis premier essai court sur la L4
+.venv-sfm/bin/python -m theta_pipeline gsplat-prepare --config configs/salon-gsplat.json --run-id salon-gsplat-006
+.venv-gsplat/bin/python -m theta_pipeline.gsplat_train train \
+  --prep Output/runs/salon-gsplat-006 --config configs/gsplat-l4-short.json
+```
+
 ## Reproduire l’audit
 
 Utiliser Python avec Pillow ≥ 10.1 et NumPy, puis depuis la racine du projet :

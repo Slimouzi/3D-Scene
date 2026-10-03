@@ -24,7 +24,13 @@ def neighbour_edges(centers, k=4):
 
 def views(panoramas, faces=12):
     return [{'panorama_id': p, 'sfm_name': f'pano_camera{f}/{p}.png',
-             'image': f'prepare/images/pano_camera{f}/{p}.png'} for p in panoramas for f in range(faces)]
+             'image': f'prepare/images/pano_camera{f}/{p}.png', 'width': 8, 'height': 8,
+             'T_face_from_panorama': np.eye(4).tolist()} for p in panoramas for f in range(faces)]
+
+
+def pano_color(pano):
+    k = sorted(CENTERS).index(pano)
+    return (10 * k, 255 - 10 * k, 7 * k)
 
 
 class SplitTests(unittest.TestCase):
@@ -187,8 +193,8 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class SplitExperimentTests(unittest.TestCase):
-    """End to end on synthetic source runs: import, freeze, gates, report, tamper detection."""
+class SplitFixture(unittest.TestCase):
+    """Synthetic ACCEPTED semantic run and masked SfM run, with real files and run.json hashes."""
 
     def setUp(self):
         from PIL import Image
@@ -232,7 +238,7 @@ class SplitExperimentTests(unittest.TestCase):
         write(sfm / 'views.json', {'views': views(CENTERS)})
         for view in views(CENTERS):
             (sfm / view['image']).parent.mkdir(parents=True, exist_ok=True)
-            (sfm / view['image']).write_bytes(view['image'].encode())
+            Image.fromarray(np.full((8, 8, 3), pano_color(view['panorama_id']), np.uint8)).save(sfm / view['image'])
         write(sfm / 'sfm/matches.json', {'edges': [{'source': a, 'target': b, 'inlier_observations': 50}
                                                    for a, b in neighbour_edges(CENTERS)]})
         (sfm / 'sfm/sparse/0').mkdir(parents=True)
@@ -263,6 +269,11 @@ class SplitExperimentTests(unittest.TestCase):
         run.stage('auto_split', split.auto_split, requires=('auto_mask', 'import_sfm'))
         run.stage('split_gates', split.split_gates, requires=('auto_split',))
         run.stage('split_report', split.split_report, requires=('split_gates',))
+
+
+
+class SplitExperimentTests(SplitFixture):
+    """End to end on synthetic source runs: import, freeze, gates, report, tamper detection."""
 
     def test_frozen_split_authorizes_evaluated_training(self):
         from theta_pipeline.storage import Run

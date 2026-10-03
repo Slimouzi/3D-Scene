@@ -307,6 +307,28 @@ def permissions(sources_ok, poses_ok, split_ok, separation_ok):
             'free_3d_navigation': 'UNKNOWN', 'product_delivery': 'UNKNOWN'}
 
 
+def verify_split_source(record, gates, config):
+    """Problems preventing evaluated training from this split, or an empty list."""
+    expected = config.get('split', {}).get('expected_partition_sha256')
+    sets = {name: record.get(name) or [] for name in SETS}
+    problems = []
+    if record.get('status') != 'frozen':
+        problems.append(f"split status is {record.get('status')}, not frozen")
+    if not expected:
+        problems.append('config split.expected_partition_sha256 is not pinned')
+    elif record.get('partition_sha256') != expected:
+        problems.append(f"partition {record.get('partition_sha256')} != pinned {expected}")
+    if partition_sha256(sets) != record.get('partition_sha256'):
+        problems.append('split lists do not match their recorded partition hash')
+    if not (gates.get('gsplat_allowed') or {}).get('evaluated') or \
+            gates.get('permissions', {}).get('evaluated_training') != 'PASS':
+        problems.append('split gates do not allow evaluated training')
+    for key in ('sfm_run', 'semantic_run'):
+        if record.get(key) != config.get(key):
+            problems.append(f'split {key} {record.get(key)} != config {config.get(key)}')
+    return problems
+
+
 # ---- Run stages ---------------------------------------------------------------
 
 def verified_copy(source, entry, rel, target):

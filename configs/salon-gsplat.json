@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "kind": "diagnostic",
+  "input": "../Input",
+  "output": "../Output/runs",
+  "erp_width": 4096,
+  "num_threads": 4,
+  "seed": 0,
+  "max_features": 8192,
+  "mapping_max_seconds": 600,
+  "masks": {},
+  "auto_mask_backend": "sam3",
+  "semantic_run": "salon-sam3-002",
+  "sfm_run": "salon-masked-003",
+  "split": {
+    "expected_partition_sha256": "3949e717cb4d730c77ba302c3974224462e33425fd18e89a67afaea88291aaae"
+  },
+  "split_run": "salon-split-005"
+}

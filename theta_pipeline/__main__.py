@@ -2,14 +2,14 @@ import argparse
 import sys
 import pycolmap
 from .storage import Run
-from . import split, stages
+from . import gsplat_prep, split, stages
 
 
 def main():
     parser = argparse.ArgumentParser(description='Theta Z1 — local CPU diagnostic pipeline')
     parser.add_argument('action', choices=['audit', 'auto-mask', 'prepare', 'seg-faces', 'seg-trial',
                                            'sfm', 'auto-gates', 'partition', 'report', 'diagnostic',
-                                           'split'])
+                                           'split', 'gsplat-prepare'])
     parser.add_argument('--config', default='configs/salon.json')
     parser.add_argument('--run-id', required=True)
     args = parser.parse_args()
@@ -21,7 +21,15 @@ def main():
             sam3 = run.config.get('auto_mask_backend') == 'sam3'
             masked = bool(run.config.get('semantic_run'))
             sfm = ['features', 'matching', 'mapping', 'diagnose']
-            if run.config.get('sfm_run'):
+            if run.config.get('split_run'):
+                # Evaluated gsplat experiment: re-validates the frozen pinned split and prepares
+                # train-only inputs on CPU. Training itself runs with theta_pipeline.gsplat_train.
+                pipeline = ['audit', 'import_split', 'gsplat_prepare']
+                if args.action not in ('gsplat-prepare', 'audit'):
+                    raise ValueError('A gsplat experiment (split_run) only supports gsplat-prepare')
+            elif args.action == 'gsplat-prepare':
+                raise ValueError('gsplat-prepare needs a config with split_run (configs/salon-gsplat.json)')
+            elif run.config.get('sfm_run'):
                 # AUTO-05 experiment: imports verified runs, proposes and freezes the split.
                 # It never trains: gsplat is a separate step gated by gate_results.json.
                 pipeline = ['audit', 'auto_mask', 'import_sfm', 'auto_split', 'split_gates', 'split_report']
@@ -46,15 +54,17 @@ def main():
                             'auto_gates': ('auto_mask', 'diagnose'),
                             'partition': ('diagnose', 'auto_gates'), 'report': ('diagnose', 'auto_gates'),
                             'import_sfm': ('audit',), 'auto_split': ('auto_mask', 'import_sfm'),
-                            'split_gates': ('auto_split',), 'split_report': ('split_gates',)}
-            if args.action in ('diagnostic', 'split'):
+                            'split_gates': ('auto_split',), 'split_report': ('split_gates',),
+                            'import_split': ('audit',), 'gsplat_prepare': ('import_split',)}
+            if args.action in ('diagnostic', 'split', 'gsplat-prepare'):
                 requested = pipeline
             elif args.action == 'sfm':
                 requested = [stage for stage in pipeline if stage != 'audit']
             else:
                 requested = [args.action.replace('-', '_')]
             for stage in requested:
-                module = split if stage in split.STAGES else stages
+                module = (split if stage in split.STAGES else
+                          gsplat_prep if stage in gsplat_prep.STAGES else stages)
                 run.stage(stage, getattr(module, stage), dependencies.get(stage, ()))
             print(f'Artifacts: {run.path}')
     except (Exception, KeyboardInterrupt) as error:

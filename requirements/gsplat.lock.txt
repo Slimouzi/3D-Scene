@@ -1,0 +1,47 @@
+# gsplat training environment (Gaussian Splatting on the GPU VM, NVIDIA L4).
+# UNQUALIFIED until tests/test_gsplat_gpu.py passes on the VM. macOS is never evidence.
+# Separate from gpu.lock.txt: gsplat 1.5.3 ships prebuilt CUDA kernels only up to
+# torch 2.4 / CUDA 12.4 / CPython 3.10; no JIT compilation is relied upon.
+#
+# python: 3.10.22
+# platform: linux x86_64, glibc >= 2.28
+# cuda: 12.4  (torch 2.4.1+cu124 wheels; driver must support CUDA 12.4, sm_89 L4 supported)
+# torch: 2.4.1+cu124
+# gsplat: 1.5.3+pt24cu124  (wheel SHA-256 01e1fd63dc69c9945e70158c818c3bb07fedf4aabcf020e6608d264cf27cc5dd)
+#
+# Resolved with: uv pip compile --python-version 3.10 --python-platform x86_64-manylinux_2_28
+#                --extra-index-url https://download.pytorch.org/whl/cu124 --index-strategy unsafe-best-match
+# Install: uv pip install --python .venv-gsplat/bin/python --extra-index-url https://download.pytorch.org/whl/cu124 \
+#          --index-strategy unsafe-best-match -r requirements/gsplat.lock.txt
+filelock==4.0.9
+fsspec==2026.9.0
+gsplat @ https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl#sha256=01e1fd63dc69c9945e70158c818c3bb07fedf4aabcf020e6608d264cf27cc5dd
+jaxtyping==0.3.7
+jinja2==3.1.6
+markdown-it-py==4.2.0
+markupsafe==3.0.4
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.4.2
+ninja==1.13.2
+numpy==1.26.4
+nvidia-cublas-cu12==12.4.2.65
+nvidia-cuda-cupti-cu12==12.4.99
+nvidia-cuda-nvrtc-cu12==12.4.99
+nvidia-cuda-runtime-cu12==12.4.99
+nvidia-cudnn-cu12==9.1.0.70
+nvidia-cufft-cu12==11.2.0.44
+nvidia-curand-cu12==10.3.5.119
+nvidia-cusolver-cu12==11.6.0.99
+nvidia-cusparse-cu12==12.3.0.142
+nvidia-nccl-cu12==2.20.5
+nvidia-nvjitlink-cu12==12.4.99
+nvidia-nvtx-cu12==12.4.99
+pillow==12.3.0
+pygments==2.21.0
+rich==15.0.0
+sympy==1.14.0
+torch==2.4.1+cu124
+triton==3.0.0
+typing-extensions==4.16.0
+wadler-lindig==0.1.7

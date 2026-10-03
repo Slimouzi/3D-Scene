@@ -48,7 +48,7 @@ class Run:
         self.config = read(config_path)
         allowed = {'schema_version', 'kind', 'input', 'output', 'erp_width', 'num_threads',
                    'seed', 'max_features', 'mapping_max_seconds', 'masks', 'auto_mask_backend',
-                   'semantic_run', 'sfm_run', 'split'}
+                   'semantic_run', 'sfm_run', 'split', 'split_run'}
         if set(self.config) - allowed:
             raise ValueError(f'Unknown config keys: {set(self.config) - allowed}')
         if self.config.get('kind') != 'diagnostic':
