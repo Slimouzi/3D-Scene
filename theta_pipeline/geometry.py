@@ -36,14 +36,24 @@ def project(image, R_face_from_pano, size, mask=False):
     u, v = erp_coordinates(directions, source.shape[1], source.shape[0])
     # Horizontal wrapping is necessary at the ERP seam; vertical coords are clamped.
     if mask:
-        # Every source sample contributing to RGB must be valid. Nearest-neighbour
-        # masks would leak excluded source pixels through bilinear interpolation.
-        x0, y0 = np.floor(u).astype(int), np.floor(v).astype(int)
-        x1, y1 = (x0 + 1) % source.shape[1], np.minimum(y0 + 1, source.shape[0] - 1)
-        valid = ((source[y0, x0] > 0) & (source[y0, x1] > 0) &
-                 (source[y1, x0] > 0) & (source[y1, x1] > 0))
-        return valid.astype(np.uint8) * 255
+        return bilinear_support_valid(source, u, v).astype(np.uint8) * 255
     return cv2.remap(source, u, v, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+
+def bilinear_support_valid(source, u, v):
+    """True where all four source pixels of the bilinear footprint are valid.
+
+    Every source sample contributing to RGB must be valid: nearest-neighbour masks would
+    leak excluded source pixels through bilinear interpolation. In float32, u can round
+    up to exactly `width` just before the seam, so columns wrap and rows are clamped.
+    """
+    height, width = source.shape[:2]
+    x0 = np.floor(u).astype(np.int64) % width
+    y0 = np.clip(np.floor(v).astype(np.int64), 0, height - 1)
+    x1 = (x0 + 1) % width
+    y1 = np.minimum(y0 + 1, height - 1)
+    return ((source[y0, x0] > 0) & (source[y0, x1] > 0) &
+            (source[y1, x0] > 0) & (source[y1, x1] > 0))
 
 
 def ownership(R_face_from_pano, all_rotations, size, index):

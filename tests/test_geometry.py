@@ -1,6 +1,7 @@
 import unittest
 import numpy as np
-from theta_pipeline.geometry import rays, erp_coordinates, cube_rotations, project, homogeneous, ownership
+from theta_pipeline.geometry import (rays, erp_coordinates, cube_rotations, project, homogeneous,
+                                     ownership, bilinear_support_valid)
 from theta_pipeline.stages import component_center_path, rotations
 from pycolmap import panorama
 
@@ -88,6 +89,37 @@ class GeometryTests(unittest.TestCase):
         self.assertTrue((out == 0).any())
         self.assertTrue((out == 255).any())
         self.assertEqual(set(np.unique(out)), {0, 255})
+
+    def test_full_resolution_mask_seam_and_rounded_width(self):
+        width, height = 6720, 3360
+        mask = np.full((height, width), 255, np.uint8)
+        mask[1000:2000, :40] = 0           # exclusion just after the seam
+        mask[1500:2500, -40:] = 0          # exclusion just before the seam
+        mask[:, 3000] = 0                  # control far from the seam
+        # Regression: just before the seam, float32 rounds u up to exactly the width.
+        lon = 2 * np.pi * (.5 / width) - np.pi - 1e-9
+        lat = np.deg2rad([0., -60.])       # row ~1679 (excluded at column 0), row ~559 (valid)
+        directions = np.stack((np.cos(lat) * np.sin(lon), np.sin(lat), np.cos(lat) * np.cos(lon)), -1)
+        u, v = erp_coordinates(directions, width, height)
+        np.testing.assert_array_equal(u, np.float32(width))
+        valid = bilinear_support_valid(mask, u, v)        # previously IndexError
+        np.testing.assert_array_equal(valid, [False, True])
+        u = np.array([width, width, width - .5, width - .5, -1e-3, 3000.2], np.float32)
+        v = np.array([1500, 100, 1600, 100, 1500, 100], np.float32)
+        np.testing.assert_array_equal(bilinear_support_valid(mask, u, v),
+                                      [False, True, False, True, False, False])
+        # Through project(): the back face straddles the seam; exclusions are preserved.
+        out = project(mask, cube_rotations()['back'], 512, mask=True)
+        self.assertEqual(set(np.unique(out)), {0, 255})
+        directions = rays(512) @ cube_rotations()['back']
+        uu, vv = erp_coordinates(directions, width, height)
+        x0 = np.floor(uu).astype(np.int64) % width
+        y0 = np.clip(np.floor(vv).astype(np.int64), 0, height - 1)
+        excluded = (mask[y0, x0] == 0) | (mask[y0, (x0 + 1) % width] == 0)
+        self.assertTrue(excluded.any())
+        self.assertTrue((out[excluded] == 0).all())
+        crossing = (x0 >= width - 40) | (x0 < 40)
+        self.assertTrue((out[crossing & ~excluded] == 255).any())
 
     def test_ownership_assigns_to_nearest_axis(self):
         rr = rotations()
