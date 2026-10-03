@@ -69,6 +69,24 @@ Après une segmentation des 13 panoramas `ACCEPTED`, lancer une nouvelle expéri
 .venv-sfm/bin/python -m theta_pipeline diagnostic --config configs/salon-masked.json --run-id salon-masked-003
 ```
 
+## Partition AUTO-05 (sans entraînement)
+
+`configs/salon-split.json` importe, après vérification des empreintes, la segmentation `salon-sam3-002` et le SfM masqué `salon-masked-003` ; ces runs ne sont ni modifiés ni réexécutés. L’action `split` propose la partition déterministe, la valide, la gèle si tous les contrôles passent, puis écrit les autorisations et le rapport. Elle ne lance aucun entraînement.
+
+```sh
+# VM, environnement CPU, au commit publié
+.venv-sfm/bin/python -m theta_pipeline split --config configs/salon-split.json --run-id salon-split-004
+```
+
+Artefacts : `split.json` (ensembles, méthode `auto05-hull-maxmin-v1`, paramètres, graine, empreintes des poses et de la partition, commit, contrôles, affectation des faces), `train_inputs.json` (images, masques et points d’initialisation de l’entraînement uniquement), `split_layout.png`, `gate_results.json`, `split_report.md`.
+
+- Unité : le panorama ; toutes ses faces suivent son ensemble.
+- Les sommets de l’enveloppe convexe des centres restent en entraînement ; chaque panorama réservé doit avoir au moins 2 stations d’entraînement parmi ses 4 plus proches voisins, être intérieur à l’enveloppe d’entraînement et covisible avec elle ; le graphe de covisibilité de l’entraînement reste connexe. Sinon : `unknown`.
+- Statuts : `frozen` (tous les contrôles PASS, commit propre), `rejected` (un contrôle FAIL), `unknown` (données incompatibles).
+- Une fois validée, recopier `partition_sha256` dans `split.expected_partition_sha256` : toute partition recalculée différente sera alors `rejected`.
+- `gsplat_allowed.exploratory` : masques acceptés et poses disponibles ; aucune métrique réservée. `gsplat_allowed.evaluated` : en plus, partition figée revalidée et séparation des données vérifiée.
+- Les poses des vues réservées proviennent du SfM conjoint sur les 13 panoramas ; le rapport le déclare. `j1_passed`, navigation et livraison produit restent inchangés / UNKNOWN.
+
 ## Reproduire l’audit
 
 Utiliser Python avec Pillow ≥ 10.1 et NumPy, puis depuis la racine du projet :

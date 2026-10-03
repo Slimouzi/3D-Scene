@@ -48,7 +48,7 @@ class Run:
         self.config = read(config_path)
         allowed = {'schema_version', 'kind', 'input', 'output', 'erp_width', 'num_threads',
                    'seed', 'max_features', 'mapping_max_seconds', 'masks', 'auto_mask_backend',
-                   'semantic_run'}
+                   'semantic_run', 'sfm_run', 'split'}
         if set(self.config) - allowed:
             raise ValueError(f'Unknown config keys: {set(self.config) - allowed}')
         if self.config.get('kind') != 'diagnostic':
@@ -82,6 +82,8 @@ class Run:
                 self.mask_paths[pano][kind] = path
                 mask_hashes[pano][kind] = digest(path)
         self.config_dir = config_path.parent
+        if self.config.get('sfm_run') and not self.config.get('semantic_run'):
+            raise ValueError('sfm_run requires semantic_run: the split experiment imports both')
         semantic = None
         if self.config.get('semantic_run'):
             # Masked SfM experiment: geometry masks come from a verified ACCEPTED segmentation run.

@@ -2,13 +2,14 @@ import argparse
 import sys
 import pycolmap
 from .storage import Run
-from . import stages
+from . import split, stages
 
 
 def main():
     parser = argparse.ArgumentParser(description='Theta Z1 — local CPU diagnostic pipeline')
     parser.add_argument('action', choices=['audit', 'auto-mask', 'prepare', 'seg-faces', 'seg-trial',
-                                           'sfm', 'auto-gates', 'partition', 'report', 'diagnostic'])
+                                           'sfm', 'auto-gates', 'partition', 'report', 'diagnostic',
+                                           'split'])
     parser.add_argument('--config', default='configs/salon.json')
     parser.add_argument('--run-id', required=True)
     args = parser.parse_args()
@@ -20,7 +21,15 @@ def main():
             sam3 = run.config.get('auto_mask_backend') == 'sam3'
             masked = bool(run.config.get('semantic_run'))
             sfm = ['features', 'matching', 'mapping', 'diagnose']
-            if masked:
+            if run.config.get('sfm_run'):
+                # AUTO-05 experiment: imports verified runs, proposes and freezes the split.
+                # It never trains: gsplat is a separate step gated by gate_results.json.
+                pipeline = ['audit', 'auto_mask', 'import_sfm', 'auto_split', 'split_gates', 'split_report']
+                if args.action not in ('split', 'audit'):
+                    raise ValueError('A split experiment (sfm_run) only supports the split action')
+            elif args.action == 'split':
+                raise ValueError('The split action needs a config with sfm_run (e.g. configs/salon-split.json)')
+            elif masked:
                 # New SfM experiment fed by the geometry masks of an ACCEPTED segmentation run.
                 pipeline = ['audit', 'auto_mask', 'prepare', *sfm, 'auto_gates', 'partition', 'report']
             elif sam3:
@@ -35,15 +44,18 @@ def main():
                             'matching': ('features',),
                             'mapping': ('matching',), 'diagnose': ('mapping',),
                             'auto_gates': ('auto_mask', 'diagnose'),
-                            'partition': ('diagnose', 'auto_gates'), 'report': ('diagnose', 'auto_gates')}
-            if args.action == 'diagnostic':
+                            'partition': ('diagnose', 'auto_gates'), 'report': ('diagnose', 'auto_gates'),
+                            'import_sfm': ('audit',), 'auto_split': ('auto_mask', 'import_sfm'),
+                            'split_gates': ('auto_split',), 'split_report': ('split_gates',)}
+            if args.action in ('diagnostic', 'split'):
                 requested = pipeline
             elif args.action == 'sfm':
                 requested = [stage for stage in pipeline if stage != 'audit']
             else:
                 requested = [args.action.replace('-', '_')]
             for stage in requested:
-                run.stage(stage, getattr(stages, stage), dependencies.get(stage, ()))
+                module = split if stage in split.STAGES else stages
+                run.stage(stage, getattr(module, stage), dependencies.get(stage, ()))
             print(f'Artifacts: {run.path}')
     except (Exception, KeyboardInterrupt) as error:
         print(f'ERROR: {error}', file=sys.stderr)

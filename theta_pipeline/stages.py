@@ -45,7 +45,8 @@ def audit(run):
     if len({r['sha256'] for r in records}) != len(records):
         raise ValueError('Duplicate source content: remove duplicated captures')
     write(run.path / 'capture.json', {'schema_version': 1, 'images': records,
-        'warning': 'Geometry and RGB exclusions require manual review. No automatic semantic masks.'})
+        'warning': 'Exclusions come only from auto_mask (SAM 3 fusion) or verified config masks; '
+                   'none is inferred at audit.'})
     return [run.path / 'capture.json']
 
 
@@ -259,7 +260,8 @@ def component_center_path(records, expected, component_id):
             'units': 'arbitrary; reconstruction coordinates only',
             'projection_axes': 'X/Z in the reconstruction frame; equal aspect required',
             'navigation_validated': False,
-            'review_reason': 'No floor, obstacle or free-space annotation is available'}
+            'review_reason': 'Navigation builder (AUTO-04) not implemented: no automatic '
+                             'free-space or floor check has run'}
 
 
 def diagnose(run):
@@ -324,14 +326,16 @@ def diagnose(run):
     enough = largest is not None and len(largest['panoramas']) >= min(12, len(expected))
     # Numeric registration alone cannot qualify a navigation route or room coverage.
     quality = {'schema_version': 1, 'kind': 'diagnostic',
-        'decision': 'requires_spatial_review' if enough else 'insufficient_registration',
+        'decision': 'registered_split_pending' if enough else 'insufficient_registration',
         'j1_passed': False, 'registered_unique_panoramas': len(registered), 'input_panoramas': len(expected),
         'components': components, 'largest_component': largest['id'] if largest else None,
         'center_path': center_path, 'center_paths_by_component': component_paths,
-        'coverage_by_zone': {'value': None, 'reason': 'Navigation route and spatial coverage not reviewed'},
-        'mask_review': {'value': None, 'reason': 'Semantic exclusions not reviewed'},
+        'coverage_by_zone': {'value': None, 'reason': 'No automatic coverage-by-zone check implemented'},
+        'mask_review': {'value': None, 'reason': 'See semantic_masks.json and gate_results.json'},
         'heldout_metrics': {'value': None, 'reason': 'All-input diagnostic; no benchmark split or training'},
-        'next_action': 'Review centers, matches, mirrors and coverage before freezing the benchmark split.'}
+        'automatic_checks': ['registration count', 'per-panorama reprojection residuals',
+                             'track lengths', 'triangulation angles', 'component center paths'],
+        'next_action': 'Freeze a partition with an AUTO-05 split experiment (action split).'}
     write(run.path / 'quality.json', quality)
     return [run.path / 'poses.json', run.path / 'quality.json']
 
@@ -382,7 +386,8 @@ def report(run):
         'Les masques sémantiques, la couverture et le parcours restent à contrôler. Les composantes ont des repères indépendants.',
         f"Centres : coordonnée Y sur {q['center_path']['coordinate_y_span'] if q['center_path']['coordinate_y_span'] is not None else 'non mesurable'} unité, repère non aligné sur une verticale physique; navigation non validée.",
         '![Centres et nuage sparse](diagnostic_centers.png)',
-        'Aucun Gaussian Splatting entraîné à ce stade. Prochaine étape : revue spatiale puis partition par panorama.', '']
+        'Aucun Gaussian Splatting entraîné à ce stade. Prochaine étape : partition automatique AUTO-05 '
+        '(action split) ; navigation non évaluée (AUTO-04 absent).', '']
     path = run.path / 'report.md'
     path.write_text('\n'.join(text))
     return [path, visualization]
@@ -410,16 +415,17 @@ def partition(run):
     if sorted(assigned) != sorted(expected):
         raise RuntimeError('Proposed panorama partition does not cover the input exactly')
     quality = read(run.path / 'quality.json')
-    can_freeze = gates['permissions']['research_training'] == 'PASS'
+    # This hard-coded pre-mask proposal is never frozen: only AUTO-05 (split.py) freezes.
+    can_freeze = False
     split = {'schema_version': 1, 'status': 'frozen' if can_freeze else 'provisional', 'unit': 'panorama',
              'protocol': 'strict_holdout', 'poses': 'exploratory_all_input',
              'train': proposed['train'], 'validation': proposed['validation'],
              'test': proposed['test'],
-             'justification': 'Initial R&D proposal; spatial review is still required',
-             'spatial_review_required': not can_freeze,
+             'justification': 'Initial R&D proposal, superseded by the AUTO-05 split experiment',
+             'spatial_review_required': False,
              'navigation_validated': quality['center_path']['navigation_validated'],
              'proposed_at': now(), 'frozen_at': now() if can_freeze else None,
-             'freeze_reason': 'All research-training gates passed' if can_freeze else gates['decision_reason']}
+             'freeze_reason': 'Not frozen: only an AUTO-05 split experiment can freeze a partition'}
     path = run.path / 'split.json'
     write(path, split)
     return [path]
@@ -453,7 +459,9 @@ def auto_gates(run):
     write(path, {'schema_version': 1, 'decision': 'accept_restricted',
                  'decision_reason': 'Unknown controls restrict permissions without requesting recapture',
                  'gates': gates, 'permissions': permissions,
-                 'gsplat_allowed': permissions['research_training'] == 'PASS',
+                 'gsplat_allowed': {'exploratory': permissions['research_training'] == 'PASS',
+                                    'evaluated': False},
+                 'gsplat_evaluated_requires': 'frozen AUTO-05 partition from a split experiment',
                  'unknown_policy': 'No UNKNOWN permission is accepted as PASS',
                  'recapture_required': False})
     return [path]

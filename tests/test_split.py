@@ -1,0 +1,255 @@
+import random
+import tempfile
+import unittest
+from pathlib import Path
+import numpy as np
+from theta_pipeline import split
+from theta_pipeline.storage import read, write
+
+# 13 stations: 7 on an outer ring (hull) and 6 inside, on a slightly tilted plane.
+ANGLES = np.deg2rad(np.arange(7) * 360 / 7)
+CENTERS = {f'P{i:02d}': [3 * np.cos(a), .05 * np.sin(2 * a), 2 * np.sin(a)] for i, a in enumerate(ANGLES)}
+CENTERS.update({f'P{7 + i:02d}': [1.2 * np.cos(a), .02, .8 * np.sin(a)]
+                for i, a in enumerate(np.deg2rad(np.arange(6) * 60 + 15))})
+
+
+def neighbour_edges(centers, k=4):
+    ids = sorted(centers)
+    edges = set()
+    for i in ids:
+        near = sorted(ids, key=lambda j: np.linalg.norm(np.subtract(centers[i], centers[j])))[1:k + 1]
+        edges |= {tuple(sorted((i, j))) for j in near}
+    return sorted(edges)
+
+
+def views(panoramas, faces=12):
+    return [{'panorama_id': p, 'sfm_name': f'pano_camera{f}/{p}.png',
+             'image': f'prepare/images/pano_camera{f}/{p}.png'} for p in panoramas for f in range(faces)]
+
+
+class SplitTests(unittest.TestCase):
+    def setUp(self):
+        self.edges = neighbour_edges(CENTERS)
+        self.proposal = split.propose(CENTERS, self.edges, split.DEFAULTS)
+        self.sets = {name: self.proposal[name] for name in split.SETS}
+
+    def frozen(self):
+        record = {**self.sets, 'poses_sha256': 'p' * 64, 'partition_sha256': split.partition_sha256(self.sets)}
+        return record
+
+    def test_partition_is_valid_and_hull_stays_in_train(self):
+        self.assertEqual(self.proposal['status'], 'proposed')
+        self.assertEqual([len(self.sets[n]) for n in split.SETS], [10, 1, 2])
+        self.assertTrue(set(self.proposal['hull_vertices']) <= set(self.sets['train']))
+        self.assertEqual(set(self.proposal['hull_vertices']), {f'P{i:02d}' for i in range(7)})
+        checks = split.validate(self.frozen(), sorted(CENTERS), 'p' * 64, views(CENTERS))
+        self.assertEqual({c['result'] for c in checks}, {'PASS'}, checks)
+
+    def test_reproducible_under_input_order_and_scale(self):
+        for seed in range(5):
+            items = list(CENTERS.items())
+            random.Random(seed).shuffle(items)
+            edges = [e[::-1] if k % 2 else e for k, e in enumerate(self.edges)]
+            random.Random(seed).shuffle(edges)
+            result = split.propose(dict(items), edges, split.DEFAULTS)
+            self.assertEqual({n: result[n] for n in split.SETS}, self.sets)
+        scaled = {k: list(np.multiply(v, 37.5) + [4, -2, 9]) for k, v in CENTERS.items()}
+        result = split.propose(scaled, self.edges, split.DEFAULTS)
+        self.assertEqual({n: result[n] for n in split.SETS}, self.sets)
+
+    def test_sets_disjoint_and_faces_grouped(self):
+        union = [p for n in split.SETS for p in self.sets[n]]
+        self.assertEqual(len(union), len(set(union)))
+        faces = split.face_assignment(self.sets, views(CENTERS))
+        for pano in CENTERS:
+            owners = {faces[f'pano_camera{f}/{pano}.png'] for f in range(12)}
+            self.assertEqual(len(owners), 1)
+        overlapping = {**self.sets, 'test': self.sets['test'] + [self.sets['train'][0]]}
+        record = {**overlapping, 'poses_sha256': 'p' * 64, 'partition_sha256': split.partition_sha256(overlapping)}
+        result = {c['name']: c['result'] for c in split.validate(record, sorted(CENTERS), 'p' * 64, views(CENTERS))}
+        self.assertEqual(result['disjoint_sets'], 'FAIL')
+        self.assertEqual(result['faces_grouped_by_panorama'], 'FAIL')
+
+    def test_empty_or_incomplete_partitions_rejected(self):
+        for broken in ({**self.sets, 'validation': []},
+                       {**self.sets, 'train': self.sets['train'][1:]}):
+            record = {**broken, 'poses_sha256': 'p' * 64, 'partition_sha256': split.partition_sha256(broken)}
+            results = {c['result'] for c in split.validate(record, sorted(CENTERS), 'p' * 64, views(CENTERS))}
+            self.assertIn('FAIL', results)
+        few = {k: CENTERS[k] for k in sorted(CENTERS)[:4]}
+        self.assertEqual(split.propose(few, neighbour_edges(few, 2), split.DEFAULTS)['status'], 'unknown')
+
+    def test_incompatible_data_is_unknown(self):
+        # Interior stations with no covisibility edge to train cannot be held out.
+        hull_only = [e for e in self.edges if e[0] < 'P07' and e[1] < 'P07']
+        result = split.propose(CENTERS, hull_only, split.DEFAULTS)
+        self.assertEqual(result['status'], 'unknown')
+        self.assertNotIn('train', result)
+
+    def test_modified_poses_or_partition_after_freeze_detected(self):
+        record = self.frozen()
+        names = lambda checks: {c['name']: c['result'] for c in checks}
+        self.assertEqual(names(split.validate(record, sorted(CENTERS), 'q' * 64, views(CENTERS)))['poses_unchanged'],
+                         'FAIL')
+        tampered = {**record, 'train': record['train'][1:], 'test': record['test'] + record['train'][:1]}
+        self.assertEqual(names(split.validate(tampered, sorted(CENTERS), 'p' * 64, views(CENTERS)))['partition_hash'],
+                         'FAIL')
+
+    def test_evaluated_training_refused_without_valid_partition(self):
+        granted = split.permissions(sources_ok=True, poses_ok=True, split_ok=False, separation_ok=False)
+        self.assertEqual(granted['exploratory_training'], 'PASS')
+        self.assertEqual(granted['evaluated_training'], 'UNKNOWN')
+        self.assertEqual(split.permissions(True, True, True, False)['evaluated_training'], 'UNKNOWN')
+        self.assertEqual(split.permissions(False, True, True, True)['evaluated_training'], 'UNKNOWN')
+        granted = split.permissions(True, True, True, True)
+        self.assertEqual(granted['evaluated_training'], 'PASS')
+        for key in ('guided_3d_navigation', 'free_3d_navigation', 'product_delivery'):
+            self.assertEqual(granted[key], 'UNKNOWN')
+
+    def test_training_inputs_contain_no_heldout_data(self):
+        held = self.sets['validation'] + self.sets['test']
+        train = self.sets['train']
+        tracks = {1: [train[0], train[1]], 2: [train[0], held[0]], 3: [held[0], held[1]], 4: [held[2]]}
+        inputs = split.train_inputs(self.sets, views(CENTERS), tracks, 'sfm-run', 'sem-run')
+        self.assertEqual(inputs['init_points']['excluded_heldout_only_point_ids'], [3, 4])
+        self.assertEqual(inputs['init_points']['eligible_point_ids'], [1, 2])
+        self.assertFalse(any(h in image for image in inputs['images'] for h in held))
+        checks = split.separation_checks(self.sets, inputs, views(CENTERS), tracks)
+        self.assertEqual({c['result'] for c in checks}, {'PASS'})
+        leaked = {**inputs, 'images': inputs['images'] + [f'prepare/images/pano_camera0/{held[0]}.png'],
+                  'init_points': {**inputs['init_points'], 'eligible_point_ids': [1, 2, 3]}}
+        results = {c['name']: c['result'] for c in split.separation_checks(self.sets, leaked, views(CENTERS), tracks)}
+        self.assertEqual(results['train_images_exclude_heldout'], 'FAIL')
+        self.assertEqual(results['init_points_have_train_support'], 'FAIL')
+
+    def test_layout_and_hash_are_canonical(self):
+        reordered = {n: list(reversed(self.sets[n])) for n in split.SETS}
+        self.assertEqual(split.partition_sha256(reordered), split.partition_sha256(self.sets))
+        with tempfile.TemporaryDirectory() as temp:
+            split.draw_layout({**self.proposal, 'status': 'frozen'}, Path(temp) / 'layout.png')
+            self.assertTrue((Path(temp) / 'layout.png').stat().st_size > 0)
+            write(Path(temp) / 'x.json', self.proposal)
+            self.assertEqual(read(Path(temp) / 'x.json')['test'], self.sets['test'])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class SplitExperimentTests(unittest.TestCase):
+    """End to end on synthetic source runs: import, freeze, gates, report, tamper detection."""
+
+    def setUp(self):
+        from PIL import Image
+        from theta_pipeline.storage import digest
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = root = Path(temp.name)
+        (root / 'input').mkdir()
+        for k, pano in enumerate(sorted(CENTERS)):
+            image = np.zeros((64, 128, 3), np.uint8)
+            image[0, 0] = k
+            Image.fromarray(image).save(root / f'input/{pano}.png')
+        base = {'schema_version': 1, 'kind': 'diagnostic', 'input': 'input', 'output': 'runs',
+                'erp_width': 128, 'num_threads': 1, 'seed': 0, 'max_features': 128,
+                'mapping_max_seconds': 10, 'masks': {}}
+        sem = root / 'runs/sem'
+        manifests = {}
+        panoramas = []
+        for pano in sorted(CENTERS):
+            mask = sem / f'segmentation/fused/{pano}/geometry_mask.png'
+            mask.parent.mkdir(parents=True)
+            Image.fromarray(np.full((64, 128), 255, np.uint8)).save(mask)
+            manifests[str(mask.relative_to(sem))] = digest(mask)
+            panoramas.append({'panorama_id': pano, 'artifacts': {'geometry_mask': str(mask.relative_to(sem))}})
+        for name in ('mask_consistency.json', 'mask_provenance.json', 'navigation_constraints.json'):
+            write(sem / name, {'schema_version': 1})
+        write(sem / 'semantic_masks.json', {'status': 'ACCEPTED', 'accepted_masks': True,
+                                            'panoramas': panoramas})
+        for name in ('semantic_masks.json', 'mask_consistency.json', 'mask_provenance.json',
+                     'navigation_constraints.json'):
+            manifests[name] = digest(sem / name)
+        write(sem / 'run.json', {'stages': {'auto_mask': {'status': 'completed', 'artifacts': manifests}}})
+
+        sfm = root / 'runs/sfm'
+        write(sfm / 'poses.json', {'poses': [{'panorama_id': p, 'status': 'registered', 'component': 0,
+                                              'center_world': c} for p, c in CENTERS.items()]})
+        write(sfm / 'quality.json', {'largest_component': 0, 'j1_passed': False})
+        write(sfm / 'views.json', {'views': views(CENTERS)})
+        write(sfm / 'sfm/matches.json', {'edges': [{'source': a, 'target': b, 'inlier_observations': 50}
+                                                   for a, b in neighbour_edges(CENTERS)]})
+        (sfm / 'sfm/sparse/0').mkdir(parents=True)
+        (sfm / 'sfm/sparse/0/points3D.bin').write_bytes(b'synthetic')
+        art = lambda *rels: {'status': 'completed', 'artifacts': {r: digest(sfm / r) for r in rels}}
+        self.base, self.sem_digest = base, digest(sem / 'semantic_masks.json')
+        inputs = {p.name: digest(p) for p in sorted((root / 'input').iterdir())}
+        write(sfm / 'run.json', {'fingerprint': 'f' * 64, 'provenance': {
+            'semantic_run': {'run': 'sem', 'semantic_masks_sha256': self.sem_digest}, 'inputs': inputs},
+            'stages': {'diagnose': art('poses.json', 'quality.json'), 'prepare': art('views.json'),
+                       'matching': art('sfm/matches.json'), 'mapping': art('sfm/sparse/0/points3D.bin')}})
+        self.config = root / 'split.json'
+        write(self.config, {**base, 'semantic_run': 'sem', 'sfm_run': 'sfm', 'split': {}})
+        train_pano = sorted(CENTERS)[0]
+        self.tracks = {1: [train_pano], 2: sorted(CENTERS)[7:9]}
+        self.patches = [(split, 'tracks_from_model', lambda path: self.tracks),
+                        (split, 'git_commit', lambda: 'a' * 40)]
+        self.originals = [(m, n, getattr(m, n)) for m, n, _ in self.patches]
+        for module, name, value in self.patches:
+            setattr(module, name, value)
+        self.addCleanup(lambda: [setattr(m, n, v) for m, n, v in self.originals])
+
+    def run_split(self, run):
+        from theta_pipeline import stages
+        run.stage('audit', stages.audit)
+        run.stage('auto_mask', stages.auto_mask, requires=('audit',))
+        run.stage('import_sfm', split.import_sfm, requires=('audit',))
+        run.stage('auto_split', split.auto_split, requires=('auto_mask', 'import_sfm'))
+        run.stage('split_gates', split.split_gates, requires=('auto_split',))
+        run.stage('split_report', split.split_report, requires=('split_gates',))
+
+    def test_frozen_split_authorizes_evaluated_training(self):
+        from theta_pipeline.storage import Run
+        with Run(self.config, 'exp').locked() as run:
+            self.run_split(run)
+            record = read(run.path / 'split.json')
+            self.assertEqual(record['status'], 'frozen', record['checks'])
+            self.assertEqual(record['git_commit'], 'a' * 40)
+            for key in ('method', 'parameters', 'seed', 'poses_sha256', 'partition_sha256', 'face_assignment'):
+                self.assertIn(key, record)
+            gates = read(run.path / 'gate_results.json')
+            self.assertEqual(gates['gsplat_allowed'], {'exploratory': True, 'evaluated': True})
+            self.assertFalse(gates['j1_passed'])
+            self.assertEqual(gates['permissions']['guided_3d_navigation'], 'UNKNOWN')
+            inputs = read(run.path / 'train_inputs.json')
+            held = record['validation'] + record['test']
+            self.assertFalse(any(h in i for i in inputs['images'] for h in held))
+            heldout_only = [pid for pid, panos in self.tracks.items() if not set(panos) & set(record['train'])]
+            self.assertEqual(inputs['init_points']['excluded_heldout_only_point_ids'], heldout_only)
+            report = (run.path / 'split_report.md').read_text()
+            for name in ('train', 'validation', 'test', 'PASS', 'SfM conjoint', 'split_layout.png'):
+                self.assertIn(name, report)
+            # A partition modified after freezing is detected, never trusted silently.
+            tampered = {**record, 'test': record['test'][:1] + record['train'][:1]}
+            write(run.path / 'split.json', tampered)
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                run.stage('split_report', split.split_report, requires=('split_gates',))
+
+    def test_pinned_partition_mismatch_is_rejected(self):
+        from theta_pipeline.storage import Run
+        write(self.config, {**self.base, 'semantic_run': 'sem', 'sfm_run': 'sfm',
+                            'split': {'expected_partition_sha256': '0' * 64}})
+        with Run(self.config, 'pinned').locked() as run:
+            self.run_split(run)
+            self.assertEqual(read(run.path / 'split.json')['status'], 'rejected')
+            gates = read(run.path / 'gate_results.json')
+            self.assertFalse(gates['gsplat_allowed']['evaluated'])
+            self.assertTrue(gates['gsplat_allowed']['exploratory'])
+
+    def test_modified_source_run_is_refused(self):
+        from theta_pipeline.storage import Run
+        write(self.root / 'runs/sfm/poses.json', {'poses': []})
+        with Run(self.config, 'tampered').locked() as run:
+            from theta_pipeline import stages
+            run.stage('audit', stages.audit)
+            with self.assertRaisesRegex(RuntimeError, 'changed'):
+                run.stage('import_sfm', split.import_sfm, requires=('audit',))
