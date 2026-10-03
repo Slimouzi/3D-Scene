@@ -1,0 +1,5 @@
+# Qualified locally: CPython 3.12 / macOS arm64, CPU.
+numpy==2.3.5
+Pillow==12.3.0
+pycolmap==4.2.1
+opencv-python-headless==4.13.0.92

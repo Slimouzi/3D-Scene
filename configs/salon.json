@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "kind": "diagnostic",
+  "input": "../Input",
+  "output": "../Output/runs",
+  "erp_width": 4096,
+  "num_threads": 4,
+  "seed": 0,
+  "max_features": 8192,
+  "mapping_max_seconds": 600,
+  "masks": {}
+}
