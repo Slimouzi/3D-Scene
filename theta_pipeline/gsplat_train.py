@@ -108,64 +108,93 @@ def render(params, viewmats, Ks, width, height, sh_degree):
 
 # ---- losses and metrics ---------------------------------------------------------
 
-def ssim_map(a, b):
-    """Per-pixel SSIM (11x11 Gaussian, sigma 1.5), channel mean; inputs [N,H,W,3] in [0,1]."""
+def ssim_map(a, b, valid):
+    """Masked SSIM (11x11 Gaussian, sigma 1.5), channel mean; inputs [N,H,W,3], valid [N,H,W].
+
+    Window statistics are computed over valid pixels only, so an excluded pixel never
+    enters any window: changing it changes neither the value nor the gradient.
+    """
     import torch
     import torch.nn.functional as F
-    x, y = a.permute(0, 3, 1, 2), b.permute(0, 3, 1, 2)
+    v = valid.to(a.dtype)[:, None]
+    x, y = a.permute(0, 3, 1, 2) * v, b.permute(0, 3, 1, 2) * v
     g = torch.exp(-(torch.arange(11, device=a.device, dtype=a.dtype) - 5) ** 2 / (2 * 1.5 ** 2))
-    g = (g / g.sum())
-    window = (g[:, None] * g[None, :]).expand(3, 1, 11, 11).contiguous()
-    blur = lambda t: F.conv2d(t, window, padding=5, groups=3)
-    mx, my = blur(x), blur(y)
-    vx, vy, cxy = blur(x * x) - mx ** 2, blur(y * y) - my ** 2, blur(x * y) - mx * my
+    g = g / g.sum()
+    window = (g[:, None] * g[None, :])[None, None]
+    blur = lambda t: F.conv2d(t.reshape(-1, 1, *t.shape[-2:]), window, padding=5).reshape(t.shape)
+    mass = blur(v).clamp_min(1e-6)
+    mean = lambda t: blur(t) / mass
+    mx, my = mean(x), mean(y)
+    vx = (mean(x * x) - mx ** 2).clamp_min(0)
+    vy = (mean(y * y) - my ** 2).clamp_min(0)
+    cxy = mean(x * y) - mx * my
     c1, c2 = .01 ** 2, .03 ** 2
     s = ((2 * mx * my + c1) * (2 * cxy + c2)) / ((mx ** 2 + my ** 2 + c1) * (vx + vy + c2))
-    return s.mean(1)
+    return s.mean(1) * valid.to(a.dtype)
 
 
 def weighted_loss(rendered, target, weight, ssim_lambda):
-    """Appearance weights (0 excluded, 0.5 reflective, 1 normal) scale every pixel term."""
-    total = weight.sum().clamp_min(1.)
+    """Appearance weights (0 excluded, 0.5 reflective, 1 normal) scale every pixel term.
+
+    A view without any valid pixel is refused: it would make an empty, meaningless loss.
+    """
+    total = weight.sum()
+    if total <= 0:
+        raise RuntimeError('training view has no valid pixel')
     l1 = (weight[..., None] * (rendered - target).abs()).sum() / (3 * total)
-    ssim = (weight * ssim_map(rendered, target)).sum() / total
+    ssim = (weight * ssim_map(rendered, target, weight > 0)).sum() / total
     return (1 - ssim_lambda) * l1 + ssim_lambda * (1 - ssim), l1, ssim
 
 
+def view_metrics(rendered, target, weight):
+    """Weighted PSNR/SSIM of one view, or None when it has no valid pixel (never 100 dB)."""
+    import torch
+    fraction = float((weight > 0).float().mean())
+    total = weight.sum()
+    if total <= 0:
+        return {'psnr': None, 'ssim': None, 'evaluated_fraction': fraction, 'excluded': True}
+    mse = (weight[..., None] * (rendered - target) ** 2).sum() / (3 * total)
+    ssim = (weight * ssim_map(rendered, target, weight > 0)).sum() / total
+    return {'psnr': float(-10 * torch.log10(mse.clamp_min(1e-10))), 'ssim': float(ssim),
+            'evaluated_fraction': fraction, 'excluded': False}
+
+
+def aggregate(group, rows, sh_degree):
+    usable = [r for r in rows if not r['excluded']]
+    return {'set': group, 'sh_degree': sh_degree, 'cameras': rows,
+            'usable_cameras': len(usable), 'excluded_cameras': [r['camera'] for r in rows if r['excluded']],
+            'mean_psnr': float(np.mean([r['psnr'] for r in usable])) if usable else None,
+            'mean_ssim': float(np.mean([r['ssim'] for r in usable])) if usable else None}
+
+
 def evaluate(params, data, sh_degree):
-    """Weighted PSNR/SSIM per camera; the evaluated fraction is reported, not hidden."""
+    """Per-view metrics; views without valid pixels are listed and left out of the means."""
     import torch
     rows = []
     with torch.no_grad():
         for i, name in enumerate(data['names']):
             rendered, _ = render(params, data['viewmats'][i:i + 1], data['Ks'][i:i + 1],
                                  data['width'], data['height'], sh_degree)
-            rendered = rendered.clamp(0, 1)
-            target = data['images'][i:i + 1].float() / 255
-            weight = data['weights'][i:i + 1].float() / 255
-            total = weight.sum().clamp_min(1.)
-            mse = (weight[..., None] * (rendered - target) ** 2).sum() / (3 * total)
-            ssim = (weight * ssim_map(rendered, target)).sum() / total
-            rows.append({'camera': name, 'psnr': float(-10 * torch.log10(mse.clamp_min(1e-10))),
-                         'ssim': float(ssim), 'evaluated_fraction': float((weight > 0).float().mean())})
-    return {'set': data['set'], 'cameras': rows,
-            'mean_psnr': float(np.mean([r['psnr'] for r in rows])),
-            'mean_ssim': float(np.mean([r['ssim'] for r in rows]))}
+            rows.append({'camera': name, **view_metrics(rendered.clamp(0, 1),
+                                                        data['images'][i:i + 1].float() / 255,
+                                                        data['weights'][i:i + 1].float() / 255)})
+    return aggregate(data['set'], rows, sh_degree)
 
 
 # ---- checkpoints -------------------------------------------------------------
 
-def save_checkpoint(folder, step, params, optimizers, scheduler, strategy_state, generator, meta):
+def save_checkpoint(folder, step, params, optimizers, scheduler, strategy_state, generator, meta, sh_degree):
     import torch
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f'step_{step:06d}.pt'
     tmp = path.with_suffix('.tmp')
-    torch.save({'step': step, 'meta': meta,
+    torch.save({'step': step, 'meta': meta, 'sh_degree': sh_degree,
                 'params': {k: v.detach().cpu() for k, v in params.items()},
                 'optimizers': {k: o.state_dict() for k, o in optimizers.items()},
                 'scheduler': scheduler.state_dict(),
                 'strategy_state': {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in strategy_state.items()},
-                'rng': {'torch': torch.get_rng_state(), 'cuda': torch.cuda.get_rng_state_all(),
+                'rng': {'torch': torch.get_rng_state(),
+                        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                         'generator': generator.get_state()}}, tmp)
     os.replace(tmp, path)
     return path
@@ -189,10 +218,11 @@ def restore(path, cfg, meta, device):
         o.load_state_dict(saved['optimizers'][k])
     state = {k: v.to(device) if hasattr(v, 'to') else v for k, v in saved['strategy_state'].items()}
     torch.set_rng_state(saved['rng']['torch'])
-    torch.cuda.set_rng_state_all(saved['rng']['cuda'])
+    if saved['rng']['cuda']:
+        torch.cuda.set_rng_state_all(saved['rng']['cuda'])
     generator = torch.Generator()
     generator.set_state(saved['rng']['generator'])
-    return saved['step'], params, optimizers, saved['scheduler'], state, generator, saved['meta']
+    return saved['step'], params, optimizers, saved['scheduler'], state, generator, saved
 
 
 # ---- training ----------------------------------------------------------------
@@ -204,10 +234,13 @@ def log_line(path, record):
 
 def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cuda'):
     """Train on train_data only. val_data is rendered without gradients for selection."""
-    import torch
-    from gsplat.strategy import DefaultStrategy
     if train_data['set'] != 'train' or (val_data is not None and val_data['set'] != 'validation'):
         raise RuntimeError('train() takes the train set for losses and the validation set for selection')
+    empty = [name for name, w in zip(train_data['names'], train_data['weights']) if not bool((w > 0).any())]
+    if empty:
+        raise RuntimeError(f'train views without any valid pixel: {empty}')
+    import torch
+    from gsplat.strategy import DefaultStrategy
     out = Path(out)
     scale = scene_scale(train_data['viewmats'])
     meta = {**meta, 'scene_scale': scale}
@@ -217,7 +250,7 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
         raise RuntimeError('--resume given but no checkpoint exists')
     if checkpoint:
         start, params, optimizers, scheduler_state, state, generator, saved = restore(checkpoint, cfg, meta, device)
-        meta['scene_scale'] = scale = saved['scene_scale']
+        meta['scene_scale'] = scale = saved['meta']['scene_scale']
     else:
         if (out / 'checkpoints').exists() and any((out / 'checkpoints').iterdir()):
             raise RuntimeError(f'{out} already has checkpoints: use --resume or a new config name')
@@ -254,10 +287,13 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
                 'ssim': ssim.item(), 'gaussians': len(params['means']), 'sh_degree': degree,
                 'lr_means': optimizers['means'].param_groups[0]['lr'],
                 'seconds': round(time.monotonic() - began, 2),
-                'max_memory_gb': round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)})
+                'max_memory_gb': round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)
+                if torch.cuda.is_available() else None})
         validate = val_data is not None and (done % cfg['validate_every'] == 0 or done == cfg['steps'])
         if done % cfg['checkpoint_every'] == 0 or done == cfg['steps'] or validate:
-            path = save_checkpoint(out / 'checkpoints', done, params, optimizers, scheduler, state, generator, meta)
+            # The degree actually used is stored, so any later evaluation renders identically.
+            path = save_checkpoint(out / 'checkpoints', done, params, optimizers, scheduler, state, generator,
+                                   meta, degree)
         if validate:
             result = evaluate(params, val_data, degree)
             log_line(out / 'validation.jsonl', {'step': done, 'checkpoint': path.name, **result})
@@ -266,13 +302,19 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
 
 
 def select(out):
-    """Checkpoint choice from validation only: best mean PSNR, earliest step on ties."""
+    """Checkpoint choice from validation only: best mean PSNR over usable views, earliest step on ties."""
     rows = [json.loads(line) for line in (Path(out) / 'validation.jsonl').read_text().splitlines()]
-    best = max(rows, key=lambda r: (r['mean_psnr'], -r['step']))
-    write(Path(out) / 'selection.json', {'criterion': 'max mean validation PSNR, earliest step on ties',
+    usable = [r for r in rows if r['mean_psnr'] is not None]
+    if not usable:
+        raise RuntimeError('no usable validation view: checkpoint selection refused')
+    best = max(usable, key=lambda r: (r['mean_psnr'], -r['step']))
+    write(Path(out) / 'selection.json', {'criterion': 'max mean validation PSNR over usable views, '
+                                                      'earliest step on ties',
                                          'step': best['step'], 'checkpoint': best['checkpoint'],
+                                         'sh_degree': best['sh_degree'],
                                          'validation_mean_psnr': best['mean_psnr'],
                                          'validation_mean_ssim': best['mean_ssim'],
+                                         'validation_usable_cameras': best['usable_cameras'],
                                          'test_used': False})
 
 
@@ -347,10 +389,9 @@ def command_evaluate_test(args):
         if training['status'] != 'completed':
             raise RuntimeError('training is not completed')
         selection = read(out / 'selection.json')
-        _, params, *_ = restore(out / 'checkpoints' / selection['checkpoint'], cfg, meta, 'cuda')
+        _, params, *_, saved = restore(out / 'checkpoints' / selection['checkpoint'], cfg, meta, 'cuda')
         test_data = load_cameras(prep, 'test', 'cuda')
-        degree = min(selection['step'] // cfg['sh_degree_interval'], cfg['sh_degree'])
-        result = evaluate(params, test_data, degree)
+        result = evaluate(params, test_data, saved['sh_degree'])
         write(target, {'schema_version': 1, 'selection': selection, **meta, **result,
                        'limitation': manifest['limitation'],
                        'quality_thresholds': 'none: metrics are reported, not judged',

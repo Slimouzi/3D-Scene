@@ -97,6 +97,7 @@ Autorisation : entraînement de recherche évalué selon le protocole AUTO-05. L
 - `gsplat-prepare` (environnement CPU) revalide la partition, la séparation et les fichiers, puis écrit `gsplat_inputs/` : caméras d’entraînement, de validation et de test dans trois fichiers distincts, poids d’apparence par face, `points.npz` (points admissibles, couleurs recalculées depuis les seules observations d’entraînement).
 - `requirements/gsplat.lock.txt` : environnement séparé (CPython 3.10.22, torch 2.4.1+cu124, gsplat 1.5.3+pt24cu124 précompilé, empreinte de la wheel figée), car gsplat ne publie pas de noyaux précompilés pour torch 2.14 / CUDA 13.
 - `theta_pipeline.gsplat_train` revérifie au démarrage l’environnement, le commit propre et identique à la préparation, la partition, l’autorisation et l’empreinte de chaque fichier lu. Pertes et densification : faces d’entraînement uniquement ; la validation choisit le checkpoint (`selection.json`) ; `evaluate-test --final` évalue le test une seule fois. Aucun seuil de qualité : les métriques sont rapportées.
+- Masques : les statistiques SSIM ne portent que sur les pixels valides ; modifier un pixel exclu ne change ni la perte, ni son gradient, ni les métriques. Une vue sans pixel valide est refusée à l’entraînement et exclue des moyennes d’évaluation (listée, jamais 100 dB) ; sans vue de validation exploitable, la sélection est refusée. Le degré d’harmoniques sphériques réellement utilisé est enregistré dans chaque checkpoint et réutilisé à l’évaluation.
 - Checkpoints reprenables (`--resume`) : paramètres, optimiseurs, planificateur, état de densification, générateurs aléatoires ; reprise refusée si configuration, entrées, partition ou commit diffèrent. Journaux : `train.jsonl`, `validation.jsonl`, `training.json`.
 
 ```sh
@@ -105,7 +106,7 @@ uv python install 3.10.22
 uv venv --python 3.10.22 .venv-gsplat
 uv pip install --python .venv-gsplat/bin/python --extra-index-url https://download.pytorch.org/whl/cu124 \
   --index-strategy unsafe-best-match -r requirements/gsplat.lock.txt
-THETA_GSPLAT_GPU=1 .venv-gsplat/bin/python -m unittest -v tests.test_gsplat_gpu
+THETA_GSPLAT_GPU=1 .venv-gsplat/bin/python -m unittest -v tests.test_gsplat_losses tests.test_gsplat_gpu
 
 # VM : préparation (CPU), puis premier essai court sur la L4
 .venv-sfm/bin/python -m theta_pipeline gsplat-prepare --config configs/salon-gsplat.json --run-id salon-gsplat-006

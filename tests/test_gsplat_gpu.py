@@ -67,6 +67,12 @@ class GsplatGpu(unittest.TestCase):
                              ['step_000010.pt', 'step_000020.pt'])
             selection = json.loads((out / 'selection.json').read_text())
             self.assertFalse(selection['test_used'])
+            # Checkpoint 10 trained its last iteration (index 9) at degree 9 // 10 = 0.
+            import torch
+            saved = torch.load(out / 'checkpoints/step_000010.pt', weights_only=False)
+            validation = [json.loads(line) for line in (out / 'validation.jsonl').read_text().splitlines()]
+            self.assertEqual(saved['sh_degree'], 0)
+            self.assertEqual(validation[0]['sh_degree'], saved['sh_degree'])
             # Simulate an interruption after step 10 and resume.
             (out / 'checkpoints/step_000020.pt').unlink()
             gsplat_train.train(train, val, points, CONFIG, out, META, resume=True)
