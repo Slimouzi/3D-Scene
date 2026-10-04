@@ -65,38 +65,98 @@ def population(params, points_xyz, scene_scale, prune_scale3d):
     return {'count_total': int(len(means)), 'non_finite': non_finite(params), **stats}
 
 
-SIGMA = 3.            # extent of a Gaussian, in standard deviations
+SIGMA = 3.            # depth extent of a Gaussian, in standard deviations along the camera axis
 NEAR_PLANE = .01      # gsplat culls centres nearer than this
+EPS2D = .3            # gsplat 2-D blur added to projected covariances
+ALPHA_THRESHOLD = 1 / 255
 
 
-def footprint(world_to_camera, K, size, means, scales):
-    """Camera depth, projected 3-sigma radius (pixels) and whether the footprint touches the face."""
-    z, uv, _ = camera_points(world_to_camera, K, size, means)
-    extent = SIGMA * np.max(scales, axis=1)
+def quat_to_rotmat(quats):
+    """Rotation matrices of wxyz quaternions, normalized as gsplat does."""
+    q = np.asarray(quats, float)
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    w, x, y, z = q.T
+    return np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+                     np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+                     np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1)], 1)
+
+
+def project_like_gsplat(world_to_camera, K, width, height, means, quats, scales, opacities):
+    """Numpy replica of gsplat 1.5.3 EWA projection (pinhole, classic): depth, centre, per-axis radii.
+
+    Radii are 0 when gsplat culls the Gaussian (near/far plane, opacity, or box outside the image).
+    Also returns the camera-frame covariance, whose zz term gives the extent along the view axis.
+    """
+    T = np.asarray(world_to_camera, float)
+    W, t = T[:3, :3], T[:3, 3]
+    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
+    cam = np.asarray(means, float) @ W.T + t
+    R = quat_to_rotmat(quats)
+    S2 = np.asarray(scales, float) ** 2
+    cov_world = np.einsum('nij,nj,nkj->nik', R, S2, R)
+    cov_cam = np.einsum('ij,njk,lk->nil', W, cov_world, W)
+    x, y, z = cam.T
+    valid = (z >= NEAR_PLANE) & (z <= 1e10)
+    zs = np.where(valid, z, 1.)
+    tan_x, tan_y = .5 * width / fx, .5 * height / fy
+    tx = zs * np.clip(x / zs, -(cx / fx + .3 * tan_x), (width - cx) / fx + .3 * tan_x)
+    ty = zs * np.clip(y / zs, -(cy / fy + .3 * tan_y), (height - cy) / fy + .3 * tan_y)
+    J = np.zeros((len(cam), 2, 3))
+    J[:, 0, 0], J[:, 1, 1] = fx / zs, fy / zs
+    J[:, 0, 2], J[:, 1, 2] = -fx * tx / zs ** 2, -fy * ty / zs ** 2
+    cov2d = np.einsum('nij,njk,nlk->nil', J, cov_cam, J)
+    cov2d[:, 0, 0] += EPS2D
+    cov2d[:, 1, 1] += EPS2D
+    det = cov2d[:, 0, 0] * cov2d[:, 1, 1] - cov2d[:, 0, 1] * cov2d[:, 1, 0]
+    opacity = np.asarray(opacities, float)
     with np.errstate(divide='ignore', invalid='ignore'):
-        radius = np.where(z > NEAR_PLANE, np.asarray(K)[0][0] * extent / z, 0.)
-    touches = ((z > NEAR_PLANE) & (uv[:, 0] + radius >= 0) & (uv[:, 0] - radius < size)
-               & (uv[:, 1] + radius >= 0) & (uv[:, 1] - radius < size))
-    return z, radius, touches, extent
+        extend = np.minimum(3.33, np.sqrt(2 * np.log(np.maximum(opacity, ALPHA_THRESHOLD) / ALPHA_THRESHOLD)))
+        rx = np.ceil(extend * np.sqrt(np.maximum(cov2d[:, 0, 0], 0)))
+        ry = np.ceil(extend * np.sqrt(np.maximum(cov2d[:, 1, 1], 0)))
+    u, v = fx * x / zs + cx, fy * y / zs + cy
+    keep = (valid & (det > 0) & (opacity >= ALPHA_THRESHOLD) & ~((rx <= 0) & (ry <= 0))
+            & ~((u + rx <= 0) | (u - rx >= width) | (v + ry <= 0) | (v - ry >= height)))
+    return {'depth': z, 'mean2d': np.stack([u, v], -1), 'radius_x': np.where(keep, rx, 0).astype(int),
+            'radius_y': np.where(keep, ry, 0).astype(int), 'touches': keep, 'cov_cam': cov_cam}
 
 
-def near_extent_gaussians(world_to_camera, K, size, means, scales, reference, factor=NEAR_FACTOR):
-    """Rendered Gaussians whose 3-sigma extent reaches nearer than factor x reference depth."""
+def depth_extent(projection):
+    """Nearest depth reached by the 3-sigma extent along the camera axis (oriented covariance)."""
+    sigma_z = np.sqrt(np.maximum(projection['cov_cam'][:, 2, 2], 0))
+    return projection['depth'] - SIGMA * sigma_z, sigma_z
+
+
+def near_extent_gaussians(world_to_camera, K, size, means, quats, scales, opacities, reference, factor=NEAR_FACTOR):
+    """Gaussians gsplat renders on the face whose depth extent reaches nearer than factor x reference."""
     if reference is None:
         return np.zeros(len(means), bool)
-    z, _, touches, extent = footprint(world_to_camera, K, size, means, scales)
-    return touches & (z - extent < factor * reference)
+    projection = project_like_gsplat(world_to_camera, K, size, size, means, quats, scales, opacities)
+    nearest, _ = depth_extent(projection)
+    return projection['touches'] & (nearest < factor * reference)
 
 
-def largest_covering(world_to_camera, K, size, means, scales, opacities, count=10):
-    """Gaussians touching the face, ranked by opacity x covered area (radius capped at the face size)."""
-    z, radius, touches, extent = footprint(world_to_camera, K, size, means, scales)
-    index = np.flatnonzero(touches)
-    score = opacities[index] * np.minimum(radius[index], size) ** 2
-    top = index[np.argsort(-score, kind='stable')[:count]]
-    return [{'index': int(i), 'depth': float(z[i]), 'extent_3sigma': float(extent[i]),
-             'projected_radius_px': float(radius[i]), 'opacity': float(opacities[i]),
-             'nearest_extent_depth': float(z[i] - extent[i])} for i in top]
+def largest_covering(world_to_camera, K, size, means, quats, scales, opacities, count=10):
+    """Gaussians rendered on the face, ranked by opacity x covered box (radii capped at the face size)."""
+    projection = project_like_gsplat(world_to_camera, K, size, size, means, quats, scales, opacities)
+    nearest, sigma_z = depth_extent(projection)
+    index = np.flatnonzero(projection['touches'])
+    area = (np.minimum(projection['radius_x'][index], size) * np.minimum(projection['radius_y'][index], size))
+    top = index[np.argsort(-(np.asarray(opacities)[index] * area), kind='stable')[:count]]
+    return [{'index': int(i), 'depth': float(projection['depth'][i]), 'sigma_depth': float(sigma_z[i]),
+             'radius_px': [int(projection['radius_x'][i]), int(projection['radius_y'][i])],
+             'centre_px': [float(v) for v in projection['mean2d'][i]], 'opacity': float(opacities[i]),
+             'nearest_extent_depth': float(nearest[i])} for i in top]
+
+
+def gsplat_radii(params, viewmat, K, size):
+    """Per-axis radii computed by gsplat itself (GPU), to cross-check the numpy replica."""
+    import torch
+    from gsplat.cuda._wrapper import fully_fused_projection
+    with torch.no_grad():
+        radii = fully_fused_projection(params['means'], None, params['quats'], torch.exp(params['scales']),
+                                       viewmat[None], K[None], size, size, eps2d=EPS2D, near_plane=NEAR_PLANE,
+                                       opacities=torch.sigmoid(params['opacities']))[0]
+    return radii.reshape(-1, 2).cpu().numpy()
 
 
 def luminance(rgb, valid):
@@ -106,14 +166,23 @@ def luminance(rgb, valid):
 
 
 def depth_range(depths, alphas):
-    values = np.concatenate([d[a > .5] for d, a in zip(depths, alphas)] or [np.zeros(0)])
+    """Common depth bounds from finite depths of covered pixels only; NaN/Inf never enter the quantiles."""
+    values = [d[(a > .5) & np.isfinite(d)] for d, a in zip(depths, alphas)]
+    values = np.concatenate(values) if values else np.zeros(0)
     return (float(np.quantile(values, .02)), float(np.quantile(values, .98))) if values.size else (0., 1.)
 
 
+INVALID_DEPTH = (255, 0, 255)
+
+
 def depth_with_range(depth, alpha, low, high):
-    out = np.zeros(depth.shape, np.uint8)
-    valid = alpha > .5
-    out[valid] = (255 * (1 - np.clip((depth[valid] - low) / max(high - low, 1e-9), 0, 1))).astype(np.uint8)
+    """Grey depth on the common scale; non-finite depths shown in magenta, uncovered pixels black."""
+    out = np.zeros(depth.shape + (3,), np.uint8)
+    finite = np.isfinite(depth)
+    shown = (alpha > .5) & finite
+    grey = (255 * (1 - np.clip((depth[shown] - low) / max(high - low, 1e-9), 0, 1))).astype(np.uint8)
+    out[shown] = grey[:, None]
+    out[~finite] = INVALID_DEPTH
     return out
 
 
@@ -140,7 +209,8 @@ def sheet(face, reference, variants, scale_note):
     columns = ('reference', 'rendu', 'erreur', 'alpha', 'profondeur')
     out = Image.new('RGB', (len(columns) * size + 230, len(variants) * size + 44), '#1d252c')
     draw = ImageDraw.Draw(out)
-    draw.text((6, 4), f'{face} — {scale_note}; profondeur {low:.3f}-{high:.3f}', fill='#f0c040')
+    draw.text((6, 4), f'{face} — {scale_note}; profondeur {low:.3f}-{high:.3f} (magenta : non finie)',
+              fill='#f0c040')
     for k, label in enumerate(columns):
         draw.text((230 + k * size + 4, 24), label, fill='white')
     for r, v in enumerate(variants):
@@ -203,8 +273,8 @@ def diagnose(prep, cfg, checkpoints, panorama, group='validation', sheet_faces=N
             valid = weight > 0
             reference = reference_depth(camera['world_to_camera'], camera['K'], size, points)
             near_centre = near_gaussians(camera['world_to_camera'], camera['K'], size, host['means'], reference)
-            near_extent = near_extent_gaussians(camera['world_to_camera'], camera['K'], size, host['means'], scales,
-                                                reference)
+            near_extent = near_extent_gaussians(camera['world_to_camera'], camera['K'], size, host['means'],
+                                                host['quats'], scales, opacity, reference)
             variants = {'complet': None}
             if name == second:
                 variants.update({'sans proches (centre)': ~near_centre, 'sans proches (étendue)': ~near_extent})
@@ -218,7 +288,8 @@ def diagnose(prep, cfg, checkpoints, panorama, group='validation', sheet_faces=N
                 entry[f'{name}/{label}'] = {
                     **metrics, 'render_luminance': luminance(rgb, valid),
                     'low_alpha_fraction_of_valid': float(((alpha < .5) & valid).sum() / max(valid.sum(), 1)),
-                    'non_finite_render': int((~np.isfinite(rgb)).sum() + (~np.isfinite(depth)).sum()),
+                    'non_finite_render': int((~np.isfinite(rgb)).sum()),
+                    'non_finite_depth_pixels': int((~np.isfinite(depth)).sum()),
                     'removed_gaussians': 0 if keep is None else int((~keep).sum()),
                     'removed_opaque': 0 if keep is None else int((~keep & (opacity > .5)).sum())}
                 renders.setdefault(face, []).append({'label': f'{Path(name).stem} {label}', 'rgb': rgb,
@@ -230,7 +301,14 @@ def diagnose(prep, cfg, checkpoints, panorama, group='validation', sheet_faces=N
             entry[f'{name}/near_extent'] = int(near_extent.sum())
             if focus_faces and face_number(face) in focus_faces:
                 entry[f'{name}/largest_covering'] = largest_covering(camera['world_to_camera'], camera['K'], size,
-                                                                     host['means'], scales, opacity)
+                                                                     host['means'], host['quats'], scales, opacity)
+            mine = project_like_gsplat(camera['world_to_camera'], camera['K'], size, size, host['means'],
+                                       host['quats'], scales, opacity)
+            theirs = gsplat_radii(params, data['viewmats'][i], data['Ks'][i], size)
+            ours = np.stack([mine['radius_x'], mine['radius_y']], -1)
+            entry[f'{name}/projection_check'] = {
+                'gaussians': int(len(ours)), 'visibility_mismatches': int(((ours > 0).all(1) != (theirs > 0).all(1)).sum()),
+                'max_radius_difference_px': int(np.abs(ours - theirs).max()) if len(ours) else 0}
         del params
         torch.cuda.empty_cache()
     if {name: digest(path) for name, path in files.items()} != before:
@@ -244,8 +322,9 @@ def diagnose(prep, cfg, checkpoints, panorama, group='validation', sheet_faces=N
               'checkpoints': {n: {**states[n], 'sha256': before[n]} for n in checkpoints},
               'ablation_checkpoint': second, 'faces': faces,
               'near_rules': {'centre': f'centre depth < {NEAR_FACTOR} x p05 depth of visible SfM points',
-                             'extent': f'(centre depth - {SIGMA:g} sigma max) < {NEAR_FACTOR} x p05 depth, '
-                                       'footprint touching the face'},
+                             'extent': f'(centre depth - {SIGMA:g} sigma along the view axis, from the oriented '
+                                       f'camera-frame covariance) < {NEAR_FACTOR} x p05 depth, Gaussian rendered on '
+                                       'the face by gsplat projection rules'},
               'hypothesis': 'obstruction by Gaussians near the camera (checked by in-memory ablation, not assumed)',
               'sheet_faces': sheet_faces, 'focus_faces': focus_faces, 'test_loaded': False, 'created_at': now()}
     write(target / 'diagnosis.json', result)
@@ -260,7 +339,9 @@ def report(result):
     get = lambda face, key, metric: (result['faces'][face].get(key) or {}).get(metric)
     lines = [f"# Diagnostic {result['training']} — {result['panorama']} ({result['set']}) : {a} → {b}", '',
              f"Hypothèse examinée : {result['hypothesis']}.",
-             f"Règles « proche » : centre — {result['near_rules']['centre']} ; étendue — {result['near_rules']['extent']}.", '',
+             f"Règles « proche » : centre — {result['near_rules']['centre']} ; étendue — {result['near_rules']['extent']}.",
+             'Projection : réplique numpy de gsplat 1.5.3 (covariance orientée, jacobienne hors axe bornée, flou 0,3, '
+             'rayons par axe), comparée aux rayons calculés par gsplat ci-dessous.', '',
              '## Métriques et luminance (pixels valides)', '',
              f'| Face | PSNR {a} | PSNR {b} | Δ | Luminance référence | Rendu {a} | Rendu {b} | Écart rendu − référence {a} / {b} |',
              '|---|---:|---:|---:|---:|---:|---:|---|']
@@ -286,12 +367,27 @@ def report(result):
     if focus:
         lines += ['', f'## Gaussiennes de plus grande extension projetée couvrant les faces examinées ({b})', '']
         for face, values in focus:
-            lines += [f'### {face}', '', '| Indice | Profondeur centre | Étendue 3σ | Rayon projeté (px) | Opacité '
-                      '| Profondeur la plus proche de l’étendue |', '|---:|---:|---:|---:|---:|---:|']
+            lines += [f'### {face}', '', '| Indice | Profondeur centre | σ profondeur | Centre projeté (px) '
+                      '| Rayons x / y (px) | Opacité | Profondeur la plus proche (3σ) |', '|---:|---:|---:|---|---|---:|---:|']
             for g in values[f'{b}/largest_covering']:
-                lines.append(f"| {g['index']} | {g['depth']:.3f} | {g['extent_3sigma']:.3f} | {g['projected_radius_px']:.0f} | "
+                lines.append(f"| {g['index']} | {g['depth']:.3f} | {g['sigma_depth']:.3f} | "
+                             f"{g['centre_px'][0]:.0f}, {g['centre_px'][1]:.0f} | {g['radius_px'][0]} / {g['radius_px'][1]} | "
                              f"{g['opacity']:.3f} | {g['nearest_extent_depth']:.3f} |")
             lines.append('')
+    checks = [(face, key, v) for face, values in result['faces'].items() for key, v in values.items()
+              if key.endswith('/projection_check')]
+    if checks:
+        mismatches = sum(v['visibility_mismatches'] for _, _, v in checks)
+        largest = max(v['max_radius_difference_px'] for _, _, v in checks)
+        lines += ['', '## Contrôle de la projection (réplique numpy contre gsplat)', '',
+                  f'Écarts de visibilité : {mismatches} ; écart maximal de rayon : {largest} px '
+                  f'({len(checks)} faces × checkpoints). Un écart non nul signale que la classification '
+                  '« étendue » doit être relue avant interprétation.']
+    depth_bad = {face: {k.split('/')[0] + ' ' + k.split('/')[1]: v['non_finite_depth_pixels']
+                        for k, v in values.items() if isinstance(v, dict) and v.get('non_finite_depth_pixels')}
+                 for face, values in result['faces'].items()}
+    depth_bad = {f: v for f, v in depth_bad.items() if v}
+    lines += ['', f"Pixels de profondeur non finie (exclus de l’échelle, en magenta) : {depth_bad or 'aucun'}."]
     lines += ['', '## Population de gaussiennes', '', '| Checkpoint | Nombre | Non finies | Opacité p05/p50/p95 '
               '| Taille ÷ scene_scale p95 / max | Hors boîte (opaques) |', '|---|---:|---|---|---|---|']
     for name, state in result['checkpoints'].items():

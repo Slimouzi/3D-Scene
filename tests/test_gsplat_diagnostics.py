@@ -188,19 +188,59 @@ class CheckpointDiagnosisTests(unittest.TestCase):
         self.assertEqual(result['non_finite']['opacities'], {'nan': 0, 'inf': 1})
         self.assertEqual(result['count'], 1)                            # statistics over finite Gaussians only
 
-    def test_extent_rule_catches_large_far_centred_gaussians(self):
+    IDENTITY = np.array([[1., 0, 0, 0]])
+
+    def test_quaternion_convention_matches_gsplat(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        q = np.array([[np.cos(np.pi / 4), 0, 0, np.sin(np.pi / 4)]])     # 90 degrees about z (wxyz)
+        np.testing.assert_allclose(cd.quat_to_rotmat(q)[0] @ [1, 0, 0], [0, 1, 0], atol=1e-12)
+        np.testing.assert_allclose(cd.quat_to_rotmat(np.array([[2., 0, 0, 0]]))[0], np.eye(3))  # normalized
+
+    def test_anisotropic_gaussian_is_not_near_without_rotation(self):
         from theta_pipeline import gsplat_checkpoint_diag as cd
         T, K, size = self.camera()
-        reference = 2.
-        means = np.array([[0, 0, 3.], [0, 0, 3.], [0, 0, .5]])
-        scales = np.array([[.05] * 3, [.9] * 3, [.01] * 3])       # second: centre at 3, 3-sigma extent to 0.3
-        centre = cd.near_gaussians(T, K, size, means, reference)
-        extent = cd.near_extent_gaussians(T, K, size, means, scales, reference)
-        np.testing.assert_array_equal(centre, [False, False, True])
-        np.testing.assert_array_equal(extent, [False, True, True])
-        ranked = cd.largest_covering(T, K, size, means, scales, np.array([.9, .9, .9]), count=2)
-        self.assertEqual([g['index'] for g in ranked], [1, 2])
-        self.assertAlmostEqual(ranked[0]['nearest_extent_depth'], 3 - 2.7)
+        means, scales, opacity = np.array([[0, 0, 3.]]), np.array([[.9, .01, .01]]), np.array([.9])
+        projection = cd.project_like_gsplat(T, K, size, size, means, self.IDENTITY, scales, opacity)
+        nearest, sigma = cd.depth_extent(projection)
+        self.assertAlmostEqual(float(sigma[0]), .01)
+        self.assertAlmostEqual(float(nearest[0]), 2.97)          # the former rule announced 0.3
+        self.assertFalse(cd.near_extent_gaussians(T, K, size, means, self.IDENTITY, scales, opacity, 2.)[0])
+
+    def test_rotated_gaussian_reaches_the_camera(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        T, K, size = self.camera()
+        about_y = np.array([[np.cos(np.pi / 4), 0, np.sin(np.pi / 4), 0]])   # long x axis turned to depth
+        means, scales, opacity = np.array([[0, 0, 3.]]), np.array([[.9, .01, .01]]), np.array([.9])
+        nearest, sigma = cd.depth_extent(cd.project_like_gsplat(T, K, size, size, means, about_y, scales, opacity))
+        self.assertAlmostEqual(float(sigma[0]), .9)
+        self.assertAlmostEqual(float(nearest[0]), .3)
+        self.assertTrue(cd.near_extent_gaussians(T, K, size, means, about_y, scales, opacity, 2.)[0])
+
+    def test_off_axis_centre_whose_footprint_enters_the_image(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        T, K, size = self.camera()
+        means, scales, opacity = np.array([[1.5, 0, 1.]]), np.array([[.5, .5, .5]]), np.array([.9])
+        projection = cd.project_like_gsplat(T, K, size, size, means, self.IDENTITY, scales, opacity)
+        self.assertGreater(projection['mean2d'][0, 0], size)       # centre outside the face
+        self.assertTrue(projection['touches'][0])                 # projected covariance covers it
+        self.assertGreater(projection['radius_x'][0], projection['mean2d'][0, 0] - size)
+        far = cd.project_like_gsplat(T, K, size, size, np.array([[1.5, 0, 1.]]), self.IDENTITY,
+                                     np.array([[.01, .01, .01]]), opacity)
+        self.assertFalse(far['touches'][0])                        # small Gaussian off the face: culled
+        ranked = cd.largest_covering(T, K, size, np.vstack([means, [[0, 0, 3.]]]), np.repeat(self.IDENTITY, 2, 0),
+                                     np.array([[.5] * 3, [.05] * 3]), np.array([.9, .9]), count=2)
+        self.assertEqual([g['index'] for g in ranked], [0, 1])
+
+    def test_on_axis_radius_matches_hand_computation(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        T, K, size = self.camera()
+        projection = cd.project_like_gsplat(T, K, size, size, np.array([[0, 0, 2.]]), self.IDENTITY,
+                                            np.array([[.2, .1, .1]]), np.array([.9]))
+        extend = min(3.33, np.sqrt(2 * np.log(.9 * 255)))
+        self.assertEqual(projection['radius_x'][0], int(np.ceil(extend * np.sqrt((8 / 2 * .2) ** 2 + .3))))
+        self.assertEqual(projection['radius_y'][0], int(np.ceil(extend * np.sqrt((8 / 2 * .1) ** 2 + .3))))
+        self.assertFalse(cd.project_like_gsplat(T, K, size, size, np.array([[0, 0, 2.]]), self.IDENTITY,
+                                                np.array([[.2, .1, .1]]), np.array([.001]))['touches'][0])
         self.assertEqual(cd.face_number('pano_camera10/R0010011.png'), 10)
 
     def test_luminance_and_shared_depth_scale(self):
@@ -211,11 +251,13 @@ class CheckpointDiagnosisTests(unittest.TestCase):
         self.assertAlmostEqual(cd.luminance(rgb, valid), .5)
         self.assertIsNone(cd.luminance(rgb, np.zeros((4, 4), bool)))
         near, far = np.full((4, 4), 1.), np.full((4, 4), 3.)
+        far[0, 0] = np.nan
         alpha = np.ones((4, 4))
         low, high = cd.depth_range([near, far], [alpha, alpha])
-        self.assertEqual((low, high), (1., 3.))
-        self.assertEqual(int(cd.depth_with_range(near, alpha, low, high)[0, 0]), 255)
-        self.assertEqual(int(cd.depth_with_range(far, alpha, low, high)[0, 0]), 0)
+        self.assertEqual((low, high), (1., 3.))                     # NaN does not contaminate the bounds
+        self.assertEqual(tuple(cd.depth_with_range(near, alpha, low, high)[1, 1]), (255, 255, 255))
+        self.assertEqual(tuple(cd.depth_with_range(far, alpha, low, high)[1, 1]), (0, 0, 0))
+        self.assertEqual(tuple(cd.depth_with_range(far, alpha, low, high)[0, 0]), cd.INVALID_DEPTH)
 
     def test_sheet_and_report(self):
         from theta_pipeline import gsplat_checkpoint_diag as cd
@@ -236,12 +278,13 @@ class CheckpointDiagnosisTests(unittest.TestCase):
                   'faces': {'pano_camera1/R0010011.png': {
                       f'{a}/complet': m(18.), f'{b}/complet': m(16.5), f'{b}/sans proches (centre)': m(16.6, 4),
                       f'{b}/sans proches (étendue)': m(17.4, 12), 'reference_luminance': .5,
-                      f'{b}/largest_covering': [{'index': 7, 'depth': 3., 'extent_3sigma': 2.7,
-                                                 'projected_radius_px': 900., 'opacity': .9,
-                                                 'nearest_extent_depth': .3}]}}}
+                      f'{b}/largest_covering': [{'index': 7, 'depth': 3., 'sigma_depth': .9, 'radius_px': [900, 40],
+                                                 'centre_px': [-20., 8.], 'opacity': .9, 'nearest_extent_depth': .3}],
+                      f'{b}/projection_check': {'gaussians': 3, 'visibility_mismatches': 0,
+                                                'max_radius_difference_px': 0}}}}
         text = cd.report(result)
-        for expected in ('-1.50', '-0.100 / -0.100', '17.40 (+0.90)', '12 (6)', '| 7 | 3.000 | 2.700 | 900 |',
-                         'aucun élagage'):
+        for expected in ('-1.50', '-0.100 / -0.100', '17.40 (+0.90)', '12 (6)', '| 7 | 3.000 | 0.900 | -20, 8 | 900 / 40 |',
+                         'Écarts de visibilité : 0', 'aucun élagage'):
             self.assertIn(expected, text)
 
     def test_test_set_refused(self):

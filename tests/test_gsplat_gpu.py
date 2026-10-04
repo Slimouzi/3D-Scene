@@ -80,6 +80,29 @@ class GsplatGpu(unittest.TestCase):
             log = [json.loads(line) for line in (Path(temp) / 'train.jsonl').read_text().splitlines()]
         self.assertEqual(log[-1]['step'], 20)
 
+    def test_numpy_projection_matches_gsplat(self):
+        import torch
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        rng = np.random.default_rng(3)
+        n, size = 2000, 64
+        means = rng.uniform([-3, -3, -.5], [3, 3, 6], (n, 3))
+        quats = rng.normal(size=(n, 4))
+        scales = np.exp(rng.uniform(-4, 0, (n, 3)))
+        opacity = rng.uniform(0, 1, n)
+        view = np.eye(4)
+        K = [[50., 0, 32], [0, 50., 32], [0, 0, 1]]
+        ours = cd.project_like_gsplat(view, K, size, size, means, quats, scales, opacity)
+        params = {'means': torch.tensor(means, dtype=torch.float32, device='cuda'),
+                  'quats': torch.tensor(quats, dtype=torch.float32, device='cuda'),
+                  'scales': torch.tensor(np.log(scales), dtype=torch.float32, device='cuda'),
+                  'opacities': torch.logit(torch.tensor(opacity, dtype=torch.float32, device='cuda'))}
+        theirs = cd.gsplat_radii(params, torch.eye(4, device='cuda'), torch.tensor(K, device='cuda'), size)
+        mine = np.stack([ours['radius_x'], ours['radius_y']], -1)
+        visible = (mine > 0).all(1) != (theirs > 0).all(1)
+        self.assertLessEqual(int(visible.sum()), n // 200)            # float32 vs float64 at the culling edges
+        both = (mine > 0).all(1) & (theirs > 0).all(1)
+        self.assertLessEqual(int(np.abs(mine[both] - theirs[both]).max()), 1)
+
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train
         rng = np.random.default_rng(0)
