@@ -15,6 +15,8 @@ The original checkpoint is only read (SHA-256 checked); a cleaned copy with the 
 indices is written for traceability. The test set is never loaded. No threshold.
 """
 import argparse
+import hashlib
+import json
 import statistics
 import sys
 from pathlib import Path
@@ -23,6 +25,25 @@ from .gsplat_checkpoint_diag import near_extent_gaussians, reference_depth
 from .storage import digest, now, read, write
 
 RULE = 'near-extent-train-views-v1'
+
+
+def canonical_sha256(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def run_identity(experiment, prep_manifest_sha256, trainings):
+    """Identity of one correction run: experiment (rule included), preparation, trainings and checkpoints."""
+    return canonical_sha256({'experiment': experiment, 'prep_manifest_sha256': prep_manifest_sha256,
+                             'trainings': trainings})
+
+
+def new_folder(path):
+    """Create a run folder; an existing one is never overwritten."""
+    path = Path(path)
+    if path.exists():
+        raise RuntimeError(f'{path} already exists: a correction run is never overwritten')
+    path.mkdir(parents=True)
+    return path
 TRACKED = ('furniture', 'mirror', 'glass', 'contours', 'other')
 
 
@@ -91,7 +112,7 @@ def compare_summaries(full, cleaned):
     return out
 
 
-def clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation, points):
+def clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation, points, run_dir, provenance):
     """One training: rule from train views, one cleaned model, both models on all validation faces."""
     import torch
     from . import gsplat_train
@@ -110,9 +131,10 @@ def clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation
     remove, counts = removal_set(train_cameras, host, points, rule)
     keep = torch.from_numpy(~remove).to(params['means'].device)
     cleaned = {k: v.detach()[keep] for k, v in params.items()}
-    target = prep / 'corrections' / experiment['name'] / cfg['name']
-    target.mkdir(parents=True, exist_ok=True)
-    torch.save({'source': checkpoint.name, 'source_sha256': original, 'rule': rule,
+    target = new_folder(run_dir / cfg['name'])
+    stamp = {**provenance, 'training': cfg['name'], 'training_config_sha256': meta['config_sha256'],
+             'checkpoint': checkpoint.name, 'checkpoint_sha256': original, 'sh_degree': saved['sh_degree']}
+    torch.save({**stamp, 'source': checkpoint.name, 'source_sha256': original, 'rule': rule,
                 'removed_indices': np.flatnonzero(remove), 'params': {k: v.cpu() for k, v in cleaned.items()}},
                target / f'cleaned_{checkpoint.name}')
     faces = {}
@@ -122,7 +144,7 @@ def clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation
     if digest(checkpoint) != original:
         raise RuntimeError(f'{checkpoint} changed during the correction experiment')
     full_summary, cleaned_summary = summarize(faces['full']), summarize(faces['cleaned'])
-    result = {'training': cfg['name'], 'seed': cfg['seed'], 'checkpoint': checkpoint.name, 'checkpoint_sha256': original,
+    result = {**stamp, 'seed': cfg['seed'],
               'gaussians': int(len(remove)), 'removed': int(remove.sum()),
               'removed_opaque': int((remove & (1 / (1 + np.exp(-host['opacities'])) > .5)).sum()),
               'train_faces_with_removals': sum(1 for v in counts.values() if v),
@@ -153,15 +175,26 @@ def run(experiment, prep):
     rel = next(r for r in manifest['files'] if r.endswith('points.npz'))
     points = np.load(load_verified(prep.parent, {'path': rel, 'sha256': manifest['files'][rel]}))['xyz']
     sources = Sources(prep.parent, manifest)
+    from .segmentation.provenance import git_commit
+    configs = [read(path) for path in experiment['trainings']]
+    trainings = {cfg['name']: {'config_sha256': gsplat_train.config_sha256(cfg),
+                               'checkpoint_sha256': digest(prep / 'training' / cfg['name'] / 'checkpoints'
+                                                           / experiment['checkpoint'])} for cfg in configs}
+    manifest_sha = digest(prep / 'gsplat_inputs/gsplat_inputs.json')
+    identity = run_identity(experiment, manifest_sha, trainings)
+    provenance = {'run_identity': identity, 'experiment_sha256': canonical_sha256(experiment),
+                  'prep_run': prep.name, 'prep_manifest_sha256': manifest_sha,
+                  'analysis_git_commit': git_commit()}
+    target = new_folder(prep / 'corrections' / experiment['name'] / identity[:16])
+    write(target / 'experiment.json', {**provenance, 'experiment': experiment, 'trainings': trainings})
     results = []
-    for path in experiment['trainings']:
-        cfg = read(path)
+    for cfg in configs:
         print(f"clean {cfg['name']}", flush=True)
-        results.append(clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation, points))
-    summary = {'experiment': experiment['name'], 'rule': experiment['rule'], 'prep_run': prep.name,
+        results.append(clean_and_evaluate(prep, cfg, experiment, sources, train_cameras, validation, points,
+                                          target, provenance))
+    summary = {**provenance, 'experiment': experiment['name'], 'rule': experiment['rule'],
                'checkpoint': experiment['checkpoint'], 'test_loaded': False, 'created_at': now(),
                'trainings': [{k: v for k, v in r.items() if k != 'faces'} for r in results]}
-    target = prep / 'corrections' / experiment['name']
     write(target / 'summary.json', summary)
     (target / 'summary.md').write_text(report(summary))
     return target
@@ -173,6 +206,9 @@ def report(summary):
     panoramas = sorted({p for r in rows for p in r['delta']})
     rule = summary['rule']
     lines = [f"# Correction {summary['experiment']} — {summary['prep_run']}, {summary['checkpoint']}", '',
+             f"Exécution `{summary.get('run_identity', '—')[:16]}` ; expérience `{summary.get('experiment_sha256', '—')[:16]}`, "
+             f"préparation `{summary.get('prep_manifest_sha256', '—')[:16]}`, commit d’analyse "
+             f"`{summary.get('analysis_git_commit')}`.", '',
              f"Règle `{rule['name']}`, définie sur les seules vues d’entraînement : retrait d’une gaussienne si, dans "
              f"au moins une face d’entraînement où gsplat la rend, son étendue ({rule['sigma']:g} σ selon l’axe de "
              f"visée) atteint moins de {rule['factor']} × le quantile {rule['reference_quantile']} des profondeurs "
@@ -208,7 +244,8 @@ def report(summary):
                              f"{statistics.median(values):+.3f} | {statistics.fmean(ssim):+.4f} | "
                              f"{sum(v > 0 for v in values)} / {sum(v < 0 for v in values)} |")
     lines += ['', 'Une région absente d’un panorama apparaît « — », jamais comme un score nul. Le détail '
-                  '(rapport des gradients rendu / référence) inférieur à 1 signale un lissage. Aucun seuil de qualité.', '']
+                  '(rapport des gradients rendu / référence, pixels intérieurs à la région seulement) inférieur à 1 '
+                  'signale un lissage ; supérieur à 1, il peut traduire du bruit autant que du détail. Aucun seuil.', '']
     return '\n'.join(lines)
 
 

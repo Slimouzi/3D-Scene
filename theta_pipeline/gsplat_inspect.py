@@ -78,19 +78,25 @@ def region_metrics(reference, rendered, weight, regions):
 def detail_ratio(reference, rendered, mask):
     """Mean luminance-gradient magnitude of the render over that of the reference, inside `mask`.
 
-    Below 1: the render is smoother than the reference there (lost detail); None if the
-    region is absent or the reference is flat.
+    Only pixels whose four central-difference neighbours also belong to `mask` are used, so
+    pixels outside the region never enter the measure. Below 1: smoother than the reference
+    (lost detail). Above 1 can be noise or artefacts as well as detail: it is not a proof of
+    faithful detail. None if no such pixel exists or the reference is flat there.
     """
+    mask = np.asarray(mask, bool)
+    inner = np.zeros_like(mask)
+    inner[1:-1, 1:-1] = (mask[1:-1, 1:-1] & mask[1:-1, :-2] & mask[1:-1, 2:] & mask[:-2, 1:-1] & mask[2:, 1:-1])
+    if not inner.any():
+        return None
+
     def gradient(image):
         y = np.asarray(image, float) @ np.array([.2126, .7152, .0722])
         gx, gy = np.zeros_like(y), np.zeros_like(y)
         gx[:, 1:-1] = y[:, 2:] - y[:, :-2]
         gy[1:-1] = y[2:] - y[:-2]
-        return np.hypot(gx, gy)
-    if not mask.any():
-        return None
-    ref = gradient(reference)[mask].mean()
-    return float(gradient(rendered)[mask].mean() / ref) if ref > 0 else None
+        return np.hypot(gx, gy)[inner]
+    ref = gradient(reference).mean()
+    return float(gradient(rendered).mean() / ref) if ref > 0 else None
 
 
 def error_image(reference, rendered, weight):

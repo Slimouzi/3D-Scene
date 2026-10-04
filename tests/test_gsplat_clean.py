@@ -56,6 +56,19 @@ class MetricTests(unittest.TestCase):
         self.assertIsNone(detail_ratio(reference, blurred, np.zeros((16, 16), bool)))
         self.assertIsNone(detail_ratio(blurred, reference, mask))            # flat reference
 
+    def test_detail_ratio_ignores_pixels_outside_the_region(self):
+        rng = np.random.default_rng(0)
+        reference = rng.uniform(0, 255, (32, 32, 3))
+        mask = np.zeros((32, 32), bool)
+        mask[8:24, 8:24] = True
+        changed = reference.copy()
+        changed[~mask] = rng.uniform(0, 255, (int((~mask).sum()), 3))     # outside only
+        self.assertAlmostEqual(detail_ratio(reference, reference, mask), 1.)
+        self.assertAlmostEqual(detail_ratio(reference, changed, mask), 1.)
+        line = np.zeros((32, 32), bool)
+        line[10, 5:25] = True                                            # no pixel with all four neighbours inside
+        self.assertIsNone(detail_ratio(reference, changed, line))
+
     def face(self, name, pano, psnr, ssim, lum, furniture=None, mirror=None, excluded=False):
         region = lambda v: {'psnr': v, 'ssim': None if v is None else .7, 'detail_ratio': None if v is None else .9}
         return {'camera': name, 'panorama_id': pano, 'psnr': psnr, 'ssim': ssim, 'excluded': excluded,
@@ -90,6 +103,25 @@ class MetricTests(unittest.TestCase):
                          'Faces dont le SSIM baisse', 'jamais comme un score nul'):
             self.assertIn(expected, text)
 
+
+
+class RunIdentityTests(unittest.TestCase):
+    def test_identity_changes_with_rule_and_folders_are_never_overwritten(self):
+        import tempfile
+        trainings = {'absgs-abs-seed0': {'config_sha256': 'c', 'checkpoint_sha256': 'k'}}
+        first = gc.run_identity(EXPERIMENT, 'm', trainings)
+        self.assertEqual(first, gc.run_identity(json.loads(json.dumps(EXPERIMENT)), 'm', trainings))
+        changed_rule = {**EXPERIMENT, 'rule': {**RULE, 'factor': .4}}
+        self.assertNotEqual(first, gc.run_identity(changed_rule, 'm', trainings))
+        self.assertNotEqual(first, gc.run_identity(EXPERIMENT, 'other-prep', trainings))
+        self.assertNotEqual(first, gc.run_identity(EXPERIMENT, 'm', {'absgs-abs-seed0': {'config_sha256': 'c',
+                                                                                      'checkpoint_sha256': 'k2'}}))
+        with tempfile.TemporaryDirectory() as temp:
+            folder = gc.new_folder(Path(temp) / first[:16])
+            (folder / 'evaluation.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'never overwritten'):
+                gc.new_folder(Path(temp) / first[:16])
+            self.assertEqual((folder / 'evaluation.json').read_text(), '{}')
 
 if __name__ == '__main__':
     unittest.main()
