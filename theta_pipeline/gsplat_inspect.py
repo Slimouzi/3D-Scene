@@ -229,10 +229,11 @@ def summarize(faces):
             'mean_region_psnr': regions}
 
 
-def inspect(prep, cfg, train_faces=3):
-    """Validation faces and selected train faces, with and without large Gaussians.
+def inspect(prep, cfg, train_faces=3, checkpoint=None, ablation=True):
+    """Validation faces and selected train faces, with (optionally) and without large Gaussians.
 
-    The selected checkpoint is copied; only the copy is read and filtered. The original
+    `checkpoint` names a file in the training's checkpoints (default: the one selected by
+    validation), e.g. step_003000.pt to compare arms at the same step. It is copied; only the copy is read and filtered. The original
     file hash is checked before and after. Out-of-box Gaussians are reported, never removed.
     """
     import shutil
@@ -249,7 +250,9 @@ def inspect(prep, cfg, train_faces=3):
     if status['status'] != 'completed':
         raise RuntimeError(f"training {cfg['name']} is {status['status']}")
     selection = read(training / 'selection.json')
-    original = training / 'checkpoints' / selection['checkpoint']
+    original = training / 'checkpoints' / (checkpoint or selection['checkpoint'])
+    if not original.is_file():
+        raise RuntimeError(f'{original.name} is not a checkpoint of {cfg["name"]}')
     original_sha = digest(original)
     root = prep / 'inspection' / f"{cfg['name']}-{original.stem}-v2"
     copy = root / 'checkpoint_copy' / original.name
@@ -266,12 +269,13 @@ def inspect(prep, cfg, train_faces=3):
     prune = cfg['strategy'].get('prune_scale3d', .1)
     large = large_gaussians(torch.exp(params['scales']).detach().cpu().numpy(), scale, prune)
     keep = torch.from_numpy(~large).to(params['means'].device)
-    variants = {'full': params,
-                'without_large': {k: v.detach()[keep] for k, v in params.items()}}
-    torch.save({'source': original.name, 'source_sha256': original_sha, 'removed_large': int(large.sum()),
-                'rule': f'max axis > {prune} x scene_scale ({scale})',
-                'params': {k: v.cpu() for k, v in variants['without_large'].items()}},
-               root / 'checkpoint_copy' / 'without_large.pt')
+    variants = {'full': params}
+    if ablation:
+        variants['without_large'] = {k: v.detach()[keep] for k, v in params.items()}
+        torch.save({'source': original.name, 'source_sha256': original_sha, 'removed_large': int(large.sum()),
+                    'rule': f'max axis > {prune} x scene_scale ({scale})',
+                    'params': {k: v.cpu() for k, v in variants['without_large'].items()}},
+                   root / 'checkpoint_copy' / 'without_large.pt')
     sources = Sources(output, manifest)
     train_cameras = read(prep / 'gsplat_inputs/cameras_train.json')['cameras']
     chosen, chosen_fractions = select_train_faces(train_cameras, sources.labels, sources.rotations,
@@ -297,6 +301,7 @@ def inspect(prep, cfg, train_faces=3):
         raise RuntimeError('the original checkpoint changed during inspection')
     summary = {
         'schema_version': 2, 'training': cfg['name'], 'checkpoint': original.name,
+        'checkpoint_choice': 'requested' if checkpoint else 'selected by validation',
         'checkpoint_sha256': original_sha, 'original_unchanged': True, 'step': saved['step'],
         'sh_degree': degree, 'prep_run': prep.name, 'partition_sha256': manifest['partition_sha256'],
         'test_loaded': False, 'checkpoint_git_commit': saved['meta']['git_commit'],
@@ -308,8 +313,8 @@ def inspect(prep, cfg, train_faces=3):
                                          torch.exp(params['scales']).detach().cpu().numpy(),
                                          torch.sigmoid(params['opacities']).detach().cpu().numpy(),
                                          points['xyz'], scale, prune),
-        'ablation': {'removed_large_gaussians': int(large.sum()), 'rule': f'max axis > {prune} x scene_scale',
-                     'out_of_box_gaussians': 'reported only, never removed'},
+        'ablation': ({'removed_large_gaussians': int(large.sum()), 'rule': f'max axis > {prune} x scene_scale',
+                      'out_of_box_gaussians': 'reported only, never removed'} if ablation else None),
         'results': {f'{g}/{v}': r['summary'] for (g, v), r in results.items()},
         'limitation': manifest['limitation'], 'quality_thresholds': 'none', 'created_at': now()}
     write(root / 'inspection.json', summary)
@@ -334,6 +339,9 @@ def write_report(root, summary, results):
               '## Effet du retrait des grandes gaussiennes, par face', '',
               '| Ensemble | Face | PSNR complet | PSNR sans grandes | Écart |', '|---|---|---:|---:|---:|']
     for group in ('validation', 'train'):
+        if (group, 'without_large') not in results:
+            lines.append(f'| {group} | — | — | — | non calculé (--no-ablation) |')
+            continue
         full = {f['camera']: f for f in results[(group, 'full')]['faces']}
         for face in results[(group, 'without_large')]['faces']:
             a, b = full[face['camera']]['psnr'], face['psnr']
@@ -358,9 +366,11 @@ def main(argv=None):
     parser.add_argument('--prep', required=True)
     parser.add_argument('--config', required=True, help='Training config of the inspected run')
     parser.add_argument('--train-faces', type=int, default=3, help='Train faces per selection group')
+    parser.add_argument('--checkpoint', help='Checkpoint file name (default: selected by validation)')
+    parser.add_argument('--no-ablation', action='store_true', help='Skip the without-large-Gaussians variant')
     args = parser.parse_args(argv)
     try:
-        root = inspect(args.prep, read(args.config), args.train_faces)
+        root = inspect(args.prep, read(args.config), args.train_faces, args.checkpoint, not args.no_ablation)
     except Exception as error:
         print(f'ERROR: {error}', file=sys.stderr)
         return 1

@@ -48,30 +48,57 @@ class DesignTests(unittest.TestCase):
 
 
 class CompareTests(unittest.TestCase):
-    def make(self, prep, name, steps, rows, gaussians=100, test_used=False):
+    def make(self, prep, name, steps, rows, gaussians=100, test_used=False, loss_offset=0.):
         folder = prep / 'training' / name
         cfg = ARMS.get(name, {'steps': steps, 'schedule': {}})
-        write(folder / 'training.json', {'status': 'completed', 'config': cfg})
+        write(folder / 'training.json', {'status': 'completed', 'config': cfg, 'history': [{}]})
         (folder / 'validation.jsonl').write_text(''.join(
             json.dumps({'step': s, 'mean_psnr': p, 'mean_ssim': .7, 'usable_cameras': 12}) + '\n' for s, p in rows))
-        (folder / 'train.jsonl').write_text(json.dumps({'step': steps, 'gaussians': gaussians}) + '\n')
+        log = [{'step': s, 'loss': .2 - s / 1e5 + loss_offset, 'gaussians': gaussians + s // 100,
+                'max_memory_gb': 1. + s / 1e4, 'seconds': s / 10.} for s in range(100, steps + 1, 100)]
+        (folder / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in log))
         write(folder / 'selection.json', {'step': rows[-1][0], 'test_used': test_used})
 
-    def test_effects_and_noise(self):
+    def inspection(self, prep, name, step, glass):
+        region = {'contours': 15., 'glass': glass, 'furniture': 17., 'mirror': None,
+                  'unvalidated_reflective': None, 'other': 20.}
+        block = {'mean_psnr': 18., 'mean_ssim': .7, 'usable_faces': 12, 'mean_region_psnr': region}
+        write(prep / 'inspection' / f'{name}-step_{step:06d}-v2/inspection.json', {
+            'checkpoint': f'step_{step:06d}.pt', 'results': {'validation/full': block, 'train/full': block},
+            'gaussians': {'larger_than_prune_scale3d': 3, 'outside_sfm_points_box_plus_25pct': 4,
+                          'outside_and_opaque_over_0_5': 1,
+                          'max_scale_over_scene_scale_quantiles': {'p50': .01, 'p95': .05, 'p99': .08, 'max': .4}}})
+
+    def test_effects_pairing_resources_and_noise(self):
         with tempfile.TemporaryDirectory() as temp:
             prep, ref = Path(temp) / 'prep', Path(temp) / 'ref'
             self.make(prep, 'ctrl-3k-s0', 3000, [(3000, 18.0)])
             self.make(prep, 'ctrl-3k-s1', 3000, [(3000, 18.5)])
-            self.make(prep, 'ctrl-10k-s0', 10000, [(3000, 18.1), (10000, 19.0)])
+            self.make(prep, 'ctrl-10k-s0', 10000, [(3000, 18.1), (10000, 19.0)], loss_offset=.001)
             self.make(ref, 'l4-short-001', 3000, [(3000, 18.2)])
+            self.inspection(prep, 'ctrl-10k-s0', 3000, 12.)
+            self.inspection(prep, 'ctrl-10k-s0', 10000, 13.5)
             result = gsplat_compare.compare(EXPERIMENT, prep, (ref, 'l4-short-001'))
-            self.assertAlmostEqual(result['effects']['duration (last step, longer - shorter)']['s0'], 1.0)
-            self.assertIsNone(result['effects']['duration (last step, longer - shorter)']['s1'])   # arm not run
-            self.assertAlmostEqual(result['effects']['duration inside the longer arm (last - step 3000)']['s0'], .9)
-            self.assertAlmostEqual(result['effects']['pruning (s1 - s0, same duration)'][3000], .5)
+            effects = result['effects']
+            self.assertAlmostEqual(effects['duration (last step, longer - shorter)']['s0'], 1.0)
+            self.assertIsNone(effects['duration (last step, longer - shorter)']['s1'])   # arm not run
+            self.assertAlmostEqual(effects['duration inside the longer arm (last - step 3000)']['s0'], .9)
+            self.assertAlmostEqual(effects['pruning (s1 - s0, same duration)'][3000], .5)
             self.assertAlmostEqual(result['noise']['replicate_minus_reference_psnr_3000'], -.2)
-            self.assertEqual(result['arms']['ctrl-10k-s1']['status'], 'not run')
-            self.assertIn('Bruit', gsplat_compare.report(result))
+            pair = result['pairing_at_3000']['s0']
+            self.assertAlmostEqual(pair['psnr_3000_long_minus_short'], .1)
+            self.assertEqual(pair['gaussians_3000_long_minus_short'], 0)
+            self.assertEqual(pair['logged_steps_compared'], 30)
+            self.assertAlmostEqual(pair['max_abs_loss_gap'], .001)
+            self.assertIsNone(result['pairing_at_3000']['s1'])
+            arm = result['arms']['ctrl-10k-s0']
+            self.assertEqual((arm['gaussians_3000'], arm['gaussians_last']), (130, 200))
+            self.assertAlmostEqual(arm['max_memory_gb'], 2.)
+            self.assertEqual(arm['inspection_last']['validation']['regions']['glass'], 13.5)
+            self.assertNotIn('loss_curve', arm)
+            text = gsplat_compare.report(result)
+            for expected in ('Bruit', 'Appariement', 'step_010000.pt', '0.0500 / 0.4000', 'contours'):
+                self.assertIn(expected, text)
 
     def test_refuses_an_arm_that_used_the_test_set(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -79,7 +106,6 @@ class CompareTests(unittest.TestCase):
             self.make(prep, 'ctrl-3k-s0', 3000, [(3000, 18.0)], test_used=True)
             with self.assertRaisesRegex(RuntimeError, 'test set'):
                 gsplat_compare.compare(EXPERIMENT, prep)
-
 
 if __name__ == '__main__':
     unittest.main()
