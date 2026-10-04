@@ -41,15 +41,28 @@ def arm_summary(prep, name):
     logged = {row['step']: row for row in log}
     pick = lambda step, key: validation[step][key] if step in validation else None
     selection = read(folder / 'selection.json') if (folder / 'selection.json').exists() else {}
-    by_panorama = {}
+    by_panorama, panoramas = {}, {}
     for camera in (validation.get(3000) or {}).get('cameras', []):
+        pano = Path(camera['camera']).stem
+        entry = panoramas.setdefault(pano, {'faces': 0, 'usable': 0, 'psnr': [], 'ssim': []})
+        entry['faces'] += 1
         if not camera.get('excluded') and camera.get('psnr') is not None:
-            by_panorama.setdefault(Path(camera['camera']).stem, []).append(camera['psnr'])
+            by_panorama.setdefault(pano, []).append(camera['psnr'])
+            entry['usable'] += 1
+            entry['psnr'].append(camera['psnr'])
+            if camera.get('ssim') is not None:
+                entry['ssim'].append(camera['ssim'])
+    mean = lambda v: sum(v) / len(v) if v else None
     memory = [row['max_memory_gb'] for row in log if row.get('max_memory_gb') is not None]
     return {'name': name, 'status': training['status'], 'steps': training['config']['steps'],
             'factors': training['config'].get('schedule', {}).get('factors'),
             'val_psnr_3000': pick(3000, 'mean_psnr'), 'val_ssim_3000': pick(3000, 'mean_ssim'),
             'val_psnr_3000_by_panorama': {k: sum(v) / len(v) for k, v in sorted(by_panorama.items())},
+            'panoramas_3000': {k: {'faces': v['faces'], 'usable': v['usable'], 'psnr': mean(v['psnr']),
+                                   'ssim': mean(v['ssim'])} for k, v in sorted(panoramas.items())},
+            'validation_curve': [{'step': step, 'mean_psnr': row['mean_psnr'], 'mean_ssim': row['mean_ssim'],
+                                  'usable': row.get('usable_cameras')} for step, row in sorted(validation.items())],
+            'selected_checkpoint': selection.get('checkpoint'),
             'last_step': last, 'val_psnr_last': pick(last, 'mean_psnr'), 'val_ssim_last': pick(last, 'mean_ssim'),
             'usable_validation_faces': pick(last, 'usable_cameras'),
             'selected_step': selection.get('step'), 'test_used': selection.get('test_used'),
@@ -58,9 +71,35 @@ def arm_summary(prep, name):
             'max_memory_gb': max(memory) if memory else None,
             'seconds': log[-1].get('seconds') if log else None,
             'runs': len(training.get('history', [])),
-            'loss_curve': {row['step']: row['loss'] for row in log},
+            'loss_curve': {row['step']: row['loss'] for row in log if 'loss' in row},
             'inspection_3000': inspection_at(prep, name, 'step_003000.pt'),
             'inspection_last': inspection_at(prep, name, f'step_{last:06d}.pt') if last else None}
+
+
+def region_coverage(prep, name, checkpoint='step_003000.pt'):
+    """Per validation panorama and region: faces where the region exists, pixels, mean PSNR.
+
+    A region absent from every face is reported as absent (mean None), never as a zero score.
+    """
+    path = Path(prep) / 'inspection' / f'{name}-{Path(checkpoint).stem}-v2' / 'validation-full' / 'inspection.json'
+    if not path.exists():
+        return None
+    out = {}
+    for face in read(path)['faces']:
+        pano = out.setdefault(face['panorama_id'], {})
+        for region, values in face['regions'].items():
+            entry = pano.setdefault(region, {'faces': 0, 'faces_present': 0, 'pixels': 0, 'psnr': []})
+            entry['faces'] += 1
+            if values['pixels'] > 0 and values['psnr'] is not None:
+                entry['faces_present'] += 1
+                entry['pixels'] += values['pixels']
+                entry['psnr'].append(values['psnr'])
+    for pano in out.values():
+        for entry in pano.values():
+            values = entry.pop('psnr')
+            entry['mean_psnr'] = sum(values) / len(values) if values else None
+            entry['absent'] = not values
+    return out
 
 
 def pairing(short, long):
@@ -177,8 +216,8 @@ def report(result):
         n = result['noise']
         lines += ['', f"Bruit : réplique − référence ({n['reference']}) à l’étape 3000 = "
                       f"{signed(n['replicate_minus_reference_psnr_3000'])} dB (SSIM "
-                      f"{signed(n['replicate_minus_reference_ssim_3000'])}). Un écart de PSNR de cet ordre "
-                      'n’est pas distinguable d’une variation entre exécutions.']
+                      f"{signed(n['replicate_minus_reference_ssim_3000'])}). C’est un repère de variation entre "
+                      'deux exécutions identiques, pas un seuil statistique.']
     lines += ['', 'Aucun gagnant n’est retenu sur le PSNR moyen seul : lire les régions (contours, vitrages, '
                   'mobilier) et les planches à 3 000 et en fin. Aucun seuil de qualité ; jeu de test non utilisé.', '']
     return '\n'.join(lines)
@@ -205,6 +244,22 @@ def paired(experiment, prep, noise=None):
                                              a.get('val_psnr_3000_by_panorama') or {}, k)
                                for k in sorted(set(a.get('val_psnr_3000_by_panorama') or {})
                                                | set(b.get('val_psnr_3000_by_panorama') or {}))}}
+        row['absolute'] = {role: {'psnr': arm.get('val_psnr_3000'), 'ssim': arm.get('val_ssim_3000'),
+                                  'panoramas': arm.get('panoramas_3000'), 'selected': arm.get('selected_checkpoint'),
+                                  'curve': arm.get('validation_curve')}
+                           for role, arm in (('baseline', a), ('variant', b))}
+        ca = region_coverage(prep, a['name'])
+        cb = region_coverage(prep, b['name'])
+        row['coverage'] = ca
+        row['coverage_identical_between_arms'] = (
+            None if ca is None or cb is None else
+            {p: {k: v['faces_present'] for k, v in r.items()} for p, r in ca.items()}
+            == {p: {k: v['faces_present'] for k, v in r.items()} for p, r in cb.items()})
+        if ca and cb:
+            row['regions_by_panorama'] = {
+                pano: {region: (None if ca[pano][region]['absent'] or cb[pano][region]['absent']
+                                else cb[pano][region]['mean_psnr'] - ca[pano][region]['mean_psnr'])
+                       for region in ca[pano]} for pano in ca}
         ia, ib = a.get('inspection_3000'), b.get('inspection_3000')
         if ia and ib:
             row['regions'] = {k: difference(ib['validation']['regions'], ia['validation']['regions'], k)
@@ -230,6 +285,15 @@ def paired(experiment, prep, noise=None):
                'regions': {k: describe((r.get('regions') or {}).get(k) for r in rows) for k in REGIONS},
                'by_panorama': {k: describe(r['by_panorama'].get(k) for r in rows)
                                for k in sorted({k for r in rows for k in r['by_panorama']})}}
+    # Is a seed's gain driven by a weak baseline or by a strong variant? Distance to the other seeds.
+    for row in rows:
+        for role in ('baseline', 'variant'):
+            others = [r['absolute'][role]['psnr'] for r in rows
+                      if r is not row and r['absolute'][role]['psnr'] is not None]
+            own = row['absolute'][role]['psnr']
+            row['absolute'][role]['minus_median_of_other_seeds'] = (
+                own - statistics.median(others) if own is not None and others else None)
+    summary['validation_panoramas'] = sorted({p for r in rows for p in r['by_panorama']})
     if noise and summary['psnr']:
         gaps = [abs(r['psnr']) for r in rows if r['psnr'] is not None]
         summary['psnr_vs_noise'] = {'noise_db': noise['psnr_db'], 'source': noise.get('source'),
@@ -242,9 +306,15 @@ def paired(experiment, prep, noise=None):
 
 def paired_report(result):
     fmt = lambda v: '—' if v is None else (f'{v:+.3f}' if isinstance(v, float) else f'{v:+d}')
+    plain = lambda v, d=3: '—' if v is None else f'{v:.{d}f}'
     labels = result.get('labels', {'baseline': 's0', 'variant': 's1'})
-    lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés {labels['variant']} − "
-             f"{labels['baseline']} à 3 000 (validation)", '',
+    base, variant = labels['baseline'], labels['variant']
+    panoramas = result['summary'].get('validation_panoramas') or []
+    scope = (f"Résultats limités aux {len(panoramas)} panoramas de validation " + ' et '.join(panoramas)
+             if len(panoramas) > 1 else f"Résultats limités au panorama de validation {panoramas[0]}"
+             if panoramas else 'Résultats limités aux panoramas de validation (non détaillés dans les journaux)')
+    lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés {variant} − {base} "
+             f"à 3 000 (validation)", '', scope + '. Jeu de test non utilisé.', '',
              '| Graine | ΔPSNR | ΔSSIM | ' + ' | '.join(f'Δ{k}' for k in REGIONS)
              + ' | Δgrandes | Δhors boîte | Δhors boîte opaques |',
              '|---:|---:|---:|' + '---:|' * len(REGIONS) + '---:|---:|---:|']
@@ -253,7 +323,54 @@ def paired_report(result):
         lines.append(f"| {r['seed']} | {fmt(r['psnr'])} | {fmt(r['ssim'])} | "
                      + ' | '.join(fmt(regions.get(k)) for k in REGIONS)
                      + f" | {fmt(r.get('large_gaussians'))} | {fmt(r.get('outside'))} | {fmt(r.get('outside_opaque'))} |")
-    lines += ['', '| Quantité | n | moyenne | médiane | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|---:|']
+    lines += ['', '## Valeurs absolues par graine et par panorama (étape 3 000)', '',
+              f'| Graine | Panorama | PSNR {base} | PSNR {variant} | SSIM {base} | SSIM {variant} | '
+              f'Vues exploitables {base} / {variant} |', '|---:|---|---:|---:|---:|---:|---|']
+    for r in result['pairs']:
+        a, b = r['absolute']['baseline'], r['absolute']['variant']
+        lines.append(f"| {r['seed']} | ensemble | {plain(a['psnr'])} | {plain(b['psnr'])} | {plain(a['ssim'], 4)} | "
+                     f"{plain(b['ssim'], 4)} | — |")
+        for pano in panoramas:
+            pa, pb = (a['panoramas'] or {}).get(pano, {}), (b['panoramas'] or {}).get(pano, {})
+            lines.append(f"| {r['seed']} | {pano} | {plain(pa.get('psnr'))} | {plain(pb.get('psnr'))} | "
+                         f"{plain(pa.get('ssim'), 4)} | {plain(pb.get('ssim'), 4)} | "
+                         f"{pa.get('usable', '—')}/{pa.get('faces', '—')} · {pb.get('usable', '—')}/{pb.get('faces', '—')} |")
+    lines += ['', '## Référence faible ou variante forte ? (PSNR moins la médiane des autres graines)', '',
+              f'| Graine | {base} | {variant} | Checkpoint choisi {base} / {variant} |', '|---:|---:|---:|---|']
+    for r in result['pairs']:
+        a, b = r['absolute']['baseline'], r['absolute']['variant']
+        lines.append(f"| {r['seed']} | {fmt(a.get('minus_median_of_other_seeds'))} | "
+                     f"{fmt(b.get('minus_median_of_other_seeds'))} | {a['selected']} / {b['selected']} |")
+    lines += ['', 'Un gain dû à une référence faible apparaît comme une valeur négative dans la colonne de '
+                  'référence ; un gain dû à la variante, comme une valeur positive dans sa colonne.', '',
+              '## Courbes de validation (PSNR moyen)', '', '| Graine | Bras | ' + ' | '.join(
+                  str(c['step']) for c in (result['pairs'][0]['absolute']['baseline']['curve'] or [])) + ' |',
+              '|---:|---|' + '---:|' * len(result['pairs'][0]['absolute']['baseline']['curve'] or [])]
+    for r in result['pairs']:
+        for role, label in (('baseline', base), ('variant', variant)):
+            lines.append(f"| {r['seed']} | {label} | "
+                         + ' | '.join(plain(c['mean_psnr']) for c in (r['absolute'][role]['curve'] or [])) + ' |')
+    coverage = next((r['coverage'] for r in result['pairs'] if r.get('coverage')), None)
+    if coverage:
+        lines += ['', '## Couverture des annotations régionales (faces où la région existe)', '',
+                  '| Panorama | ' + ' | '.join(REGIONS) + ' |', '|---|' + '---|' * len(REGIONS)]
+        for pano, regions in sorted(coverage.items()):
+            cells = [('absente (0/{})'.format(regions[k]['faces']) if regions[k]['absent'] else
+                      f"{regions[k]['faces_present']}/{regions[k]['faces']}") if k in regions else 'non calculée'
+                     for k in REGIONS]
+            lines.append(f'| {pano} | ' + ' | '.join(cells) + ' |')
+        consistent = {r['seed']: r.get('coverage_identical_between_arms') for r in result['pairs']}
+        lines += ['', f'Couverture identique entre bras (mêmes annotations) : {consistent}.',
+                  'Une région absente n’a pas de score : elle est exclue, jamais comptée comme nulle.', '',
+                  f'## Écarts {variant} − {base} par panorama et par région', '',
+                  '| Graine | Panorama | ' + ' | '.join(REGIONS) + ' |', '|---:|---|' + '---:|' * len(REGIONS)]
+        for r in result['pairs']:
+            for pano, values in sorted((r.get('regions_by_panorama') or {}).items()):
+                lines.append(f"| {r['seed']} | {pano} | " + ' | '.join(
+                    'absente' if (r['coverage'] or {}).get(pano, {}).get(k, {}).get('absent') else fmt(values.get(k))
+                    for k in REGIONS) + ' |')
+    lines += ['', '## Synthèse sur les graines', '',
+              '| Quantité | n | moyenne | médiane | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|---:|']
     items = [('PSNR', result['summary']['psnr']), ('SSIM', result['summary']['ssim']),
              ('grandes gaussiennes', result['summary']['large_gaussians']),
              ('hors boîte', result['summary']['outside']),
@@ -265,13 +382,16 @@ def paired_report(result):
             sd = '—' if d['sd'] is None else f"{d['sd']:.3f}"
             lines.append(f"| {label} | {d['n']} | {d['mean']:+.3f} | {d['median']:+.3f} | {sd} | "
                          f"{d['positive']} | {d['negative']} |")
+    lines += ['', 'L’écart-type entre graines mesure la variabilité observée (graine, ordre des caméras et '
+                  'non-déterminisme GPU confondus) ; il n’isole pas à lui seul le non-déterminisme GPU.']
     noise = result['summary'].get('psnr_vs_noise')
     if noise:
-        lines += ['', f"Bruit de réplication : {noise['noise_db']:.3f} dB ({noise['source']}). "
-                      f"|moyenne ΔPSNR| / bruit = {noise['abs_mean_over_noise']:.2f} ; "
-                      f"graines où |ΔPSNR| dépasse le bruit : {noise['seeds_beyond_noise']}/{noise['seeds']}."]
+        lines += ['', f"Repère historique : {noise['noise_db']:.3f} dB, écart entre deux exécutions identiques mesuré "
+                      f"sur une autre partition ({noise['source']}). Ce n’est pas un seuil statistique ; le rapport "
+                      f"|moyenne ΔPSNR| / repère ({noise['abs_mean_over_noise']:.2f}) et le nombre de graines au-delà "
+                      f"({noise['seeds_beyond_noise']}/{noise['seeds']}) ne prouvent pas la robustesse du gain."]
     lines += ['', 'Lecture : un écart moyen petit devant son écart-type, ou de signe instable, ne départage pas '
-                  'les bras. Aucun gagnant sur le PSNR moyen seul ; résultats limités au panorama de validation.', '']
+                  'les bras. Aucun gagnant sur le PSNR moyen seul ; lire les régions et les planches. ' + scope + '.', '']
     return '\n'.join(lines)
 
 

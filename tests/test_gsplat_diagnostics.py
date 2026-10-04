@@ -132,7 +132,8 @@ class SheetTests(unittest.TestCase):
                 Image.fromarray(np.full((8, 8, 3), 100, np.uint8)).save(path)
                 files[panel] = f'{stem}/{panel}.png'
             rows.append({'camera': face, 'psnr': 18., 'low_alpha_fraction_of_valid': .01, 'files': files,
-                         'regions': {'glass': {'psnr': 14.}, 'contours': {'psnr': 15.}, 'furniture': {'psnr': None}}})
+                         'regions': {'glass': {'psnr': 14., 'pixels': 5}, 'contours': {'psnr': 15., 'pixels': 5},
+                                     'furniture': {'psnr': None, 'pixels': 0}}})
         write(folder / 'validation-full' / 'inspection.json', {'faces': rows})
 
     def test_sheet_and_refusals(self):
@@ -145,7 +146,10 @@ class SheetTests(unittest.TestCase):
             self.assertEqual(gs.main(['--prep', temp, '--name', 'x', '--columns', *columns, '--size', '16']), 0)
             image = Image.open(prep / 'comparisons/x/validation_sheet.jpg')
             self.assertEqual(image.size, (3 * 16, 40 + 2 * (3 * 16 + 22)))
-            self.assertIn('ctrl-10k-s0 @ 10000', (prep / 'comparisons/x/validation_sheet.md').read_text())
+            text = (prep / 'comparisons/x/validation_sheet.md').read_text()
+            self.assertIn('ctrl-10k-s0 @ 10000', text)
+            self.assertIn('| absente |', text)                    # furniture has no pixels in the fixture
+            self.assertIn('panoramas de validation R', text)
             self.inspection(prep, 'ctrl-3k-s1', 'step_003000.pt', faces[:1])
             with self.assertRaisesRegex(RuntimeError, 'same validation faces'):
                 gs.load_columns(prep, [columns[0], 'ctrl-3k-s1:step_003000.pt'])

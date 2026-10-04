@@ -144,7 +144,8 @@ class PairedSeedTests(unittest.TestCase):
             self.assertAlmostEqual(noise['abs_mean_over_noise'], (0.2 / 3) / .244)
             text = gsplat_compare.paired_report(result)
             self.assertIn('médiane', text)
-            self.assertIn('Bruit de réplication : 0.244', text)
+            self.assertIn('Repère historique : 0.244 dB', text)
+            self.assertIn('pas un seuil statistique', text)
 
 if __name__ == '__main__':
     unittest.main()

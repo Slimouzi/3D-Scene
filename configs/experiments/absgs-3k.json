@@ -8,12 +8,15 @@
   "prep_run": "salon-gsplat-009",
   "split_run": "salon-split-006",
   "partition_sha256": "3f77f8c543330327620d05d340653fd68d645081346e857df2ea559e064be14d",
-  "validation_panoramas": "two (R0010006 and the panorama moved by the extended split)",
+  "validation_panoramas": "R0010006 and R0010011",
   "design": "paired: for each seed 0, 1, 2 a baseline and an AbsGS arm, 3000 steps, same schedule (densification i = 600..2400, no large-Gaussian pruning, position LR decay over 3000 steps, SH degree <= 2)",
   "seeds": [
     0,
     1,
-    2
+    2,
+    3,
+    4,
+    5
   ],
   "arms": [
     "configs/gsplat-absgs-base-seed0.json",
@@ -21,7 +24,13 @@
     "configs/gsplat-absgs-base-seed1.json",
     "configs/gsplat-absgs-abs-seed1.json",
     "configs/gsplat-absgs-base-seed2.json",
-    "configs/gsplat-absgs-abs-seed2.json"
+    "configs/gsplat-absgs-abs-seed2.json",
+    "configs/gsplat-absgs-base-seed3.json",
+    "configs/gsplat-absgs-abs-seed3.json",
+    "configs/gsplat-absgs-base-seed4.json",
+    "configs/gsplat-absgs-abs-seed4.json",
+    "configs/gsplat-absgs-base-seed5.json",
+    "configs/gsplat-absgs-abs-seed5.json"
   ],
   "labels": {
     "baseline": "défaut",
@@ -42,6 +51,21 @@
       "seed": 2,
       "baseline": "absgs-base-seed2",
       "variant": "absgs-abs-seed2"
+    },
+    {
+      "seed": 3,
+      "baseline": "absgs-base-seed3",
+      "variant": "absgs-abs-seed3"
+    },
+    {
+      "seed": 4,
+      "baseline": "absgs-base-seed4",
+      "variant": "absgs-abs-seed4"
+    },
+    {
+      "seed": 5,
+      "baseline": "absgs-base-seed5",
+      "variant": "absgs-abs-seed5"
     }
   ],
   "metrics": {
@@ -52,11 +76,12 @@
       "comparative sheets"
     ]
   },
-  "reading": "mean, median, standard deviation and signs over seeds, read against the replicate noise; no winner on mean PSNR alone",
+  "reading": "mean, median, standard deviation and signs over all seeds, without selecting favourable seeds; the standard deviation is the observed variability, not an isolated GPU non-determinism; the 0.244 dB replicate gap is a historical reference from another partition, not a statistical threshold; no winner on mean PSNR alone",
   "not_used": [
     "test set R0010008, R0010014 (reserved; evaluate-test --final not run)",
     "global size pruning",
     "longer trainings"
   ],
-  "quality_thresholds": "none"
+  "quality_thresholds": "none",
+  "seed_status": "seeds 0-2 run; seeds 3-5 run only if the inspection of seeds 0-2 (absolute values, curves, sheets, region coverage) shows no anomaly; the six pairs are analysed together, none excluded"
 }

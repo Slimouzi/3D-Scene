@@ -44,6 +44,17 @@ class DesignTests(unittest.TestCase):
                 self.assertEqual(schedule['refine'], list(range(600, 2500, 100)))
                 self.assertEqual(schedule['large_pruning'], [])        # no global size pruning
 
+    def test_six_seeds_with_unchanged_variants(self):
+        self.assertEqual(EXPERIMENT['seeds'], [0, 1, 2, 3, 4, 5])
+        self.assertEqual([p['seed'] for p in EXPERIMENT['pairs']], EXPERIMENT['seeds'])
+        for seed in (3, 4, 5):
+            for arm in ('base', 'abs'):
+                new, old = load(f'absgs-{arm}-seed{seed}'), load(f'absgs-{arm}-seed0')
+                strip = lambda c: {k: v for k, v in c.items() if k not in ('name', 'seed', 'schedule')}
+                self.assertEqual(strip(new), strip(old))
+                self.assertEqual(new['seed'], seed)
+        self.assertIn('none excluded', EXPERIMENT['seed_status'])
+
     def test_test_set_stays_reserved(self):
         self.assertTrue(any('R0010008' in item and 'evaluate-test' in item for item in EXPERIMENT['not_used']))
 
@@ -112,6 +123,57 @@ class PairedAnalysisTests(unittest.TestCase):
             self.assertIn('AbsGS − défaut', text)
             self.assertIn('panorama R0010011', text)
 
+
+
+class AbsoluteAndCoverageTests(unittest.TestCase):
+    """Seed 2-style check: is a gain driven by a weak baseline? Regions absent are never zero."""
+
+    def make(self, prep, name, values, ssim=.7, curve=(16., 17.)):
+        folder = prep / 'training' / name
+        write(folder / 'training.json', {'status': 'completed', 'config': load(name), 'history': [{}]})
+        cameras = [{'camera': f'pano_camera{k}/{pano}.png', 'psnr': value, 'ssim': ssim, 'excluded': False}
+                   for pano, value in values.items() for k in range(2)]
+        cameras.append({'camera': 'pano_camera9/R0010011.png', 'psnr': None, 'ssim': None, 'excluded': True})
+        mean = sum(values.values()) / len(values)
+        rows = [{'step': 1000, 'mean_psnr': curve[0], 'mean_ssim': .6, 'usable_cameras': 4},
+                {'step': 2000, 'mean_psnr': curve[1], 'mean_ssim': .65, 'usable_cameras': 4},
+                {'step': 3000, 'mean_psnr': mean, 'mean_ssim': ssim, 'usable_cameras': 4, 'cameras': cameras}]
+        (folder / 'validation.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        (folder / 'train.jsonl').write_text(json.dumps({'step': 3000, 'gaussians': 10}) + '\n')
+        write(folder / 'selection.json', {'step': 3000, 'checkpoint': 'step_003000.pt', 'test_used': False})
+        faces = [{'panorama_id': pano, 'regions': {
+                    'glass': {'pixels': 50, 'psnr': value - 3}, 'mirror': {'pixels': 0, 'psnr': None},
+                    'contours': {'pixels': 30, 'psnr': value - 2}}}
+                 for pano, value in values.items() for _ in range(2)]
+        write(prep / 'inspection' / f'{name}-step_003000-v2' / 'validation-full' / 'inspection.json', {'faces': faces})
+
+    def test_absolute_values_deviation_and_absent_regions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prep = Path(temp)
+            baselines = {0: 18., 1: 18.1, 2: 17.0}            # seed 2: weak baseline
+            for seed, value in baselines.items():
+                self.make(prep, f'absgs-base-seed{seed}', {'R0010006': value, 'R0010011': value - 1})
+                self.make(prep, f'absgs-abs-seed{seed}', {'R0010006': 18.2, 'R0010011': 17.2}, ssim=.72)
+            result = gsplat_compare.paired(EXPERIMENT, prep, {'psnr_db': .244, 'source': 'salon-gsplat-007'})
+            seed2 = next(r for r in result['pairs'] if r['seed'] == 2)
+            self.assertAlmostEqual(seed2['absolute']['baseline']['minus_median_of_other_seeds'], 16.5 - 17.55)
+            self.assertAlmostEqual(seed2['absolute']['variant']['minus_median_of_other_seeds'], 0.)
+            pano = seed2['absolute']['baseline']['panoramas']['R0010011']
+            self.assertEqual((pano['usable'], pano['faces']), (2, 3))
+            self.assertEqual([c['step'] for c in seed2['absolute']['baseline']['curve']], [1000, 2000, 3000])
+            coverage = seed2['coverage']['R0010006']
+            self.assertTrue(coverage['mirror']['absent'])
+            self.assertIsNone(coverage['mirror']['mean_psnr'])
+            self.assertEqual(coverage['glass']['faces_present'], 2)
+            self.assertIsNone(seed2['regions_by_panorama']['R0010006']['mirror'])
+            self.assertTrue(seed2['coverage_identical_between_arms'])
+            text = gsplat_compare.paired_report(result)
+            self.assertIn('Résultats limités aux 2 panoramas de validation R0010006 et R0010011', text)
+            self.assertIn('absente (0/2)', text)
+            self.assertIn('Repère historique', text)
+            self.assertIn('ne prouvent pas la robustesse', text)
+            self.assertIn('n’isole pas à lui seul le non-déterminisme GPU', text)
+            self.assertNotIn('| mirror | 0.000', text)
 
 if __name__ == '__main__':
     unittest.main()

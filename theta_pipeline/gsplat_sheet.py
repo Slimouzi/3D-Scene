@@ -74,6 +74,13 @@ def sheet(columns, faces, size=256):
     return out
 
 
+def region_cell(region):
+    """A region absent from the face is written 'absente', never a score."""
+    if not region or region.get('pixels', 0) == 0:
+        return 'absente'
+    return '—' if region.get('psnr') is None else f"{region['psnr']:.2f}"
+
+
 def table(columns, faces):
     fmt = lambda v: '—' if v is None else f'{v:.2f}'
     lines = ['| Face | Colonne | PSNR | ' + ' | '.join(REGIONS) + ' | alpha < 0,5 |',
@@ -82,7 +89,7 @@ def table(columns, faces):
         for column in columns:
             f = column['faces'][face]
             lines.append(f"| {face} | {column['label']} | {fmt(f['psnr'])} | "
-                         + ' | '.join(fmt(f['regions'].get(r, {}).get('psnr')) for r in REGIONS)
+                         + ' | '.join(region_cell(f['regions'].get(r)) for r in REGIONS)
                          + f" | {f['low_alpha_fraction_of_valid']:.3f} |")
     return lines
 
@@ -113,7 +120,9 @@ def main(argv=None):
                  'Lignes par face : rendu, carte d’erreur (pixels exclus en bleu), profondeur attendue '
                  '(les flottants y apparaissent comme des taches proches).', '',
                  '![Planche](validation_sheet.jpg)', '', *table(columns, faces), '',
-                 'Résultats limités au panorama de validation ; aucun seuil de qualité.', '']
+                 'Une région absente d’une face est notée « absente » et n’est jamais comptée comme nulle.',
+                 'Résultats limités aux panoramas de validation '
+                 + ' et '.join(sorted({Path(f).stem for f in faces})) + ' ; aucun seuil de qualité.', '']
         (target / 'validation_sheet.md').write_text('\n'.join(lines))
         write(target / 'validation_sheet.json', {'columns': args.columns, 'faces': faces, 'created_at': now()})
     except Exception as error:
