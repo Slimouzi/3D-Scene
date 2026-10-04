@@ -41,17 +41,22 @@ def arm_summary(prep, name):
     logged = {row['step']: row for row in log}
     pick = lambda step, key: validation[step][key] if step in validation else None
     selection = read(folder / 'selection.json') if (folder / 'selection.json').exists() else {}
+    by_panorama = {}
+    for camera in (validation.get(3000) or {}).get('cameras', []):
+        if not camera.get('excluded') and camera.get('psnr') is not None:
+            by_panorama.setdefault(Path(camera['camera']).stem, []).append(camera['psnr'])
     memory = [row['max_memory_gb'] for row in log if row.get('max_memory_gb') is not None]
     return {'name': name, 'status': training['status'], 'steps': training['config']['steps'],
             'factors': training['config'].get('schedule', {}).get('factors'),
             'val_psnr_3000': pick(3000, 'mean_psnr'), 'val_ssim_3000': pick(3000, 'mean_ssim'),
+            'val_psnr_3000_by_panorama': {k: sum(v) / len(v) for k, v in sorted(by_panorama.items())},
             'last_step': last, 'val_psnr_last': pick(last, 'mean_psnr'), 'val_ssim_last': pick(last, 'mean_ssim'),
             'usable_validation_faces': pick(last, 'usable_cameras'),
             'selected_step': selection.get('step'), 'test_used': selection.get('test_used'),
             'gaussians_3000': logged.get(3000, {}).get('gaussians'),
-            'gaussians_last': log[-1]['gaussians'] if log else None,
+            'gaussians_last': log[-1].get('gaussians') if log else None,
             'max_memory_gb': max(memory) if memory else None,
-            'seconds': log[-1]['seconds'] if log else None,
+            'seconds': log[-1].get('seconds') if log else None,
             'runs': len(training.get('history', [])),
             'loss_curve': {row['step']: row['loss'] for row in log},
             'inspection_3000': inspection_at(prep, name, 'step_003000.pt'),
@@ -180,7 +185,7 @@ def report(result):
 
 
 def paired(experiment, prep, noise=None):
-    """Per-seed differences s1 - s0 at step 3000 on validation; mean, median, spread and signs.
+    """Per-seed differences variant - baseline (s1 - s0) at 3000 on validation; mean, median, spread, signs.
 
     `noise` is the replicate gap in PSNR (dB), e.g. {'psnr_db': 0.244, 'source': ...}.
     """
@@ -190,11 +195,16 @@ def paired(experiment, prep, noise=None):
         pairs.append({'seed': 0, 's0': 'ctrl-3k-s0', 's1': 'ctrl-3k-s1'})
     rows = []
     for pair in sorted(pairs, key=lambda p: p['seed']):
-        a, b = arm_summary(prep, pair['s0']), arm_summary(prep, pair['s1'])
+        a = arm_summary(prep, pair.get('baseline', pair.get('s0')))
+        b = arm_summary(prep, pair.get('variant', pair.get('s1')))
         if a.get('test_used') or b.get('test_used'):
             raise RuntimeError('an arm used the test set: the comparison is not valid')
         row = {'seed': pair['seed'], 'status': (a['status'], b['status']),
-               'psnr': difference(b, a, 'val_psnr_3000'), 'ssim': difference(b, a, 'val_ssim_3000')}
+               'psnr': difference(b, a, 'val_psnr_3000'), 'ssim': difference(b, a, 'val_ssim_3000'),
+               'by_panorama': {k: difference(b.get('val_psnr_3000_by_panorama') or {},
+                                             a.get('val_psnr_3000_by_panorama') or {}, k)
+                               for k in sorted(set(a.get('val_psnr_3000_by_panorama') or {})
+                                               | set(b.get('val_psnr_3000_by_panorama') or {}))}}
         ia, ib = a.get('inspection_3000'), b.get('inspection_3000')
         if ia and ib:
             row['regions'] = {k: difference(ib['validation']['regions'], ia['validation']['regions'], k)
@@ -217,19 +227,24 @@ def paired(experiment, prep, noise=None):
                'large_gaussians': describe(r.get('large_gaussians') for r in rows),
                'outside': describe(r.get('outside') for r in rows),
                'outside_opaque': describe(r.get('outside_opaque') for r in rows),
-               'regions': {k: describe((r.get('regions') or {}).get(k) for r in rows) for k in REGIONS}}
+               'regions': {k: describe((r.get('regions') or {}).get(k) for r in rows) for k in REGIONS},
+               'by_panorama': {k: describe(r['by_panorama'].get(k) for r in rows)
+                               for k in sorted({k for r in rows for k in r['by_panorama']})}}
     if noise and summary['psnr']:
         gaps = [abs(r['psnr']) for r in rows if r['psnr'] is not None]
         summary['psnr_vs_noise'] = {'noise_db': noise['psnr_db'], 'source': noise.get('source'),
                                     'abs_mean_over_noise': abs(summary['psnr']['mean']) / noise['psnr_db'],
                                     'seeds_beyond_noise': sum(g > noise['psnr_db'] for g in gaps), 'seeds': len(gaps)}
+    labels = experiment.get('labels', {'baseline': 's0', 'variant': 's1'})
     return {'experiment': experiment['name'], 'prep_run': Path(prep).name, 'pairs': rows, 'summary': summary,
-            'difference': 's1 - s0 at step 3000, validation only', 'quality_thresholds': 'none', 'created_at': now()}
+            'labels': labels, 'difference': f"{labels['variant']} - {labels['baseline']} at step 3000, validation only", 'quality_thresholds': 'none', 'created_at': now()}
 
 
 def paired_report(result):
     fmt = lambda v: '—' if v is None else (f'{v:+.3f}' if isinstance(v, float) else f'{v:+d}')
-    lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés s1 − s0 à 3 000 (validation)", '',
+    labels = result.get('labels', {'baseline': 's0', 'variant': 's1'})
+    lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés {labels['variant']} − "
+             f"{labels['baseline']} à 3 000 (validation)", '',
              '| Graine | ΔPSNR | ΔSSIM | ' + ' | '.join(f'Δ{k}' for k in REGIONS)
              + ' | Δgrandes | Δhors boîte | Δhors boîte opaques |',
              '|---:|---:|---:|' + '---:|' * len(REGIONS) + '---:|---:|---:|']
@@ -244,6 +259,7 @@ def paired_report(result):
              ('hors boîte', result['summary']['outside']),
              ('hors boîte opaques', result['summary']['outside_opaque'])]
     items += [(f'région {k}', v) for k, v in result['summary']['regions'].items()]
+    items += [(f'panorama {k}', v) for k, v in result['summary'].get('by_panorama', {}).items()]
     for label, d in items:
         if d:
             sd = '—' if d['sd'] is None else f"{d['sd']:.3f}"

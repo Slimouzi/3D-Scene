@@ -1,0 +1,62 @@
+{
+  "name": "absgs-3k",
+  "status": "defined, not run",
+  "question": "Does AbsGS densification (absolute 2-D gradients) improve novel-view quality, in particular on glass, contours and furniture, relative to the default criterion?",
+  "modification": "only the densification criterion: strategy.absgrad = true and grow_grad2d = 0.0008 (one method; gsplat states the threshold must be raised with absgrad); everything else identical",
+  "reference": "AbsGS: Recovering Fine Details for 3D Gaussian Splatting (arXiv 2404.10484)",
+  "prep_config": "configs/salon-gsplat-v2.json",
+  "prep_run": "salon-gsplat-009",
+  "split_run": "salon-split-006",
+  "partition_sha256": "3f77f8c543330327620d05d340653fd68d645081346e857df2ea559e064be14d",
+  "validation_panoramas": "two (R0010006 and the panorama moved by the extended split)",
+  "design": "paired: for each seed 0, 1, 2 a baseline and an AbsGS arm, 3000 steps, same schedule (densification i = 600..2400, no large-Gaussian pruning, position LR decay over 3000 steps, SH degree <= 2)",
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "arms": [
+    "configs/gsplat-absgs-base-seed0.json",
+    "configs/gsplat-absgs-abs-seed0.json",
+    "configs/gsplat-absgs-base-seed1.json",
+    "configs/gsplat-absgs-abs-seed1.json",
+    "configs/gsplat-absgs-base-seed2.json",
+    "configs/gsplat-absgs-abs-seed2.json"
+  ],
+  "labels": {
+    "baseline": "défaut",
+    "variant": "AbsGS"
+  },
+  "pairs": [
+    {
+      "seed": 0,
+      "baseline": "absgs-base-seed0",
+      "variant": "absgs-abs-seed0"
+    },
+    {
+      "seed": 1,
+      "baseline": "absgs-base-seed1",
+      "variant": "absgs-abs-seed1"
+    },
+    {
+      "seed": 2,
+      "baseline": "absgs-base-seed2",
+      "variant": "absgs-abs-seed2"
+    }
+  ],
+  "metrics": {
+    "primary": "paired difference AbsGS - baseline of mean validation PSNR and SSIM at 3000, overall and per validation panorama",
+    "secondary": [
+      "region PSNR (glass, contours, furniture, mirror, unvalidated reflective)",
+      "Gaussian count, large and out-of-box (opaque) Gaussians",
+      "comparative sheets"
+    ]
+  },
+  "reading": "mean, median, standard deviation and signs over seeds, read against the replicate noise; no winner on mean PSNR alone",
+  "not_used": [
+    "test set R0010008, R0010014 (reserved; evaluate-test --final not run)",
+    "global size pruning",
+    "longer trainings"
+  ],
+  "quality_thresholds": "none"
+}

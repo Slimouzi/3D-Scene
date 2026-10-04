@@ -118,6 +118,9 @@ Autorisation : entraînement de recherche évalué selon le protocole AUTO-05. L
 - Répétitions appariées `configs/experiments/paired-seeds-3k.json` (définies, non lancées) : 6 graines × {s0, s1} à 3 000 itérations sur une nouvelle préparation `salon-gsplat-008`, à lancer seulement si le diagnostic de divergence est satisfaisant ; analyse appariée s1 − s0 (moyenne, médiane, écart-type, signes, régions, grandes gaussiennes, hors boîte et hors boîte opaques, rapport au bruit de réplication via `--noise-from`) par `gsplat_compare`. L’élagage global par taille (s1) n’y figure que comme bras de comparaison : il n’est pas réintroduit dans les configurations suivantes.
 - Le retrait des grandes gaussiennes après entraînement n’est qu’une variante d’inspection sur copie ; il n’est jamais appliqué au modèle conservé.
 
+- Expérience A, `configs/experiments/absgs-3k.json` : densification AbsGS (gradients 2-D absolus, `absgrad=true`, `grow_grad2d=0.0008`) contre le critère par défaut, seule modification ; graines 0, 1, 2 ; 3 000 itérations ; préparation `salon-gsplat-009` (partition `3f77f8c5…be14d`, deux panoramas de validation) ; aucun élagage global par taille ; analyse appariée AbsGS − défaut, globale, par panorama de validation et par région.
+- Règle de code au démarrage : le code de préparation doit être identique à celui qui a préparé les entrées ; les modules d’entraînement et d’analyse (`TRAINING_MODULES`) peuvent avoir évolué, sur un commit propre, et la liste des modules modifiés est enregistrée dans `training.json`.
+
 ```sh
 # VM : environnement gsplat
 uv python install 3.10.22

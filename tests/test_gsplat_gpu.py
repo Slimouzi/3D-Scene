@@ -69,6 +69,17 @@ class GsplatGpu(unittest.TestCase):
         self.assertAlmostEqual(float(renders[0, 4, 4, 3]), 2., delta=.3)     # expected depth
         self.assertGreater(float(alphas[0, 4, 4, 0]), .5)
 
+    def test_absgs_densification_trains(self):
+        from theta_pipeline import gsplat_train
+        rng = np.random.default_rng(1)
+        points = {'ids': np.arange(200), 'xyz': rng.uniform(-.5, .5, (200, 3)), 'rgb': rng.uniform(0, 1, (200, 3))}
+        cfg = {**CONFIG, 'name': 'absgs', 'strategy': {**CONFIG['strategy'], 'absgrad': True, 'grow_grad2d': .0008}}
+        with tempfile.TemporaryDirectory() as temp:
+            gsplat_train.train(synthetic('train', 6, 'cuda'), synthetic('validation', 2, 'cuda'), points, cfg,
+                               Path(temp), META)
+            log = [json.loads(line) for line in (Path(temp) / 'train.jsonl').read_text().splitlines()]
+        self.assertEqual(log[-1]['step'], 20)
+
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train
         rng = np.random.default_rng(0)

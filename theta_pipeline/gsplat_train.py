@@ -100,14 +100,14 @@ def optimizers_for(params, cfg, scale):
             for name in params}
 
 
-def render(params, viewmats, Ks, width, height, sh_degree):
+def render(params, viewmats, Ks, width, height, sh_degree, absgrad=False):
     import torch
     from gsplat import rasterization
     colors = torch.cat([params['sh0'], params['shN']], 1)
     renders, _, info = rasterization(
         means=params['means'], quats=params['quats'], scales=torch.exp(params['scales']),
         opacities=torch.sigmoid(params['opacities']), colors=colors, viewmats=viewmats, Ks=Ks,
-        width=width, height=height, sh_degree=sh_degree, packed=False)
+        width=width, height=height, sh_degree=sh_degree, packed=False, absgrad=absgrad)
     return renders, info
 
 
@@ -313,8 +313,10 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
     for step in range(start, cfg['steps']):
         index = int(torch.randint(n, (1,), generator=generator))
         degree = min(step // cfg['sh_degree_interval'], cfg['sh_degree'])
+        # AbsGS: absolute 2-D gradients are needed by DefaultStrategy(absgrad=True).
         rendered, info = render(params, train_data['viewmats'][index:index + 1], train_data['Ks'][index:index + 1],
-                                train_data['width'], train_data['height'], degree)
+                                train_data['width'], train_data['height'], degree,
+                                absgrad=cfg['strategy'].get('absgrad', False))
         strategy.step_pre_backward(params, optimizers, state, step, info)
         target = train_data['images'][index:index + 1].float() / 255
         weight = train_data['weights'][index:index + 1].float() / 255
@@ -398,6 +400,7 @@ def command_train(args):
     status = {'schema_version': 1, 'name': cfg['name'], 'config': cfg, **meta,
               'prep_run': prep.name, 'split_run': manifest['split_run'],
               'environment': report['environment'], 'cameras': manifest['cameras'],
+              'training_code_changed_since_preparation': report['training_code_changed_since_preparation'],
               'points': manifest['points'], 'protocol': manifest['protocol'],
               'limitation': manifest['limitation'],
               'quality_thresholds': 'none: metrics are reported, not judged',

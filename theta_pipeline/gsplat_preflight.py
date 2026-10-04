@@ -123,9 +123,23 @@ def verify_prep(prep):
     return problems
 
 
+# Training and read-only analysis modules may change between preparation and training (the
+# training commit is clean and recorded); every other module produced or checked the inputs.
+TRAINING_MODULES = {'gsplat_train.py', 'gsplat_preflight.py', 'gsplat_inspect.py', 'gsplat_compare.py',
+                    'gsplat_divergence.py', 'gsplat_sheet.py', 'gsplat_camera_check.py'}
+
+
+def code_differences(prep_code, current):
+    """Changed files, split into preparation code (must be identical) and training code."""
+    changed = sorted(k for k in set(prep_code) | set(current) if prep_code.get(k) != current.get(k))
+    return {'preparation': [k for k in changed if k not in TRAINING_MODULES],
+            'training': [k for k in changed if k in TRAINING_MODULES]}
+
+
 def code_matches_prep(prep):
+    """True when the code that prepared the inputs is unchanged (training modules may differ)."""
     state = read(Path(prep) / 'run.json')
-    return state['provenance']['code'] == code_digests()
+    return not code_differences(state['provenance']['code'], code_digests())['preparation']
 
 
 def preflight(prep):
@@ -135,10 +149,13 @@ def preflight(prep):
     problems = list(environment['problems'])
     if commit is None or commit.endswith('-dirty'):
         problems.insert(0, f'git commit {commit}: training needs a clean fixed commit')
-    if not code_matches_prep(prep):
-        problems.append('code differs from the code that prepared the inputs')
+    differences = code_differences(read(Path(prep) / 'run.json')['provenance']['code'], code_digests())
+    if differences['preparation']:
+        problems.append(f"preparation code differs from the code that prepared the inputs: "
+                        f"{differences['preparation']}")
     problems += verify_prep(prep)
-    return {'ok': not problems, 'problems': problems, 'git_commit': commit, 'environment': environment}
+    return {'ok': not problems, 'problems': problems, 'git_commit': commit, 'environment': environment,
+            'training_code_changed_since_preparation': differences['training']}
 
 
 def load_verified(output, record):
