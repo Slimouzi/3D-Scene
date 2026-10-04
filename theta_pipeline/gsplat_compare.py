@@ -422,6 +422,10 @@ def paired_report(result):
     if chosen['psnr']:
         lines.append(f"\nMoyenne ΔPSNR aux checkpoints choisis : {chosen['psnr']['mean']:+.3f} dB "
                      f"(médiane {chosen['psnr']['median']:+.3f}, > 0 : {chosen['psnr']['positive']}/{chosen['psnr']['n']}).")
+        for pano, d in chosen.get('by_panorama', {}).items():
+            if d:
+                lines.append(f"- {pano} : moyenne {d['mean']:+.3f}, médiane {d['median']:+.3f}, "
+                             f"> 0 : {d['positive']}/{d['n']}, < 0 : {d['negative']}/{d['n']}")
     signs = result['summary'].get('region_signs') or {}
     if signs:
         lines += ['', '## Cohérence des signes par panorama et par région (étape 3 000)', '',

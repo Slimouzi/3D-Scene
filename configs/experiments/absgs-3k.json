@@ -83,5 +83,16 @@
     "longer trainings"
   ],
   "quality_thresholds": "none",
-  "seed_status": "seeds 0-2 run; seeds 3-5 run only if the inspection of seeds 0-2 (absolute values, curves, sheets, region coverage) shows no anomaly; the six pairs are analysed together, none excluded"
+  "seed_status": "seeds 0-2 run; seeds 3-5 to run with unchanged parameters; the six pairs are analysed together, none excluded, at step 3000 and at the selected checkpoints, per validation panorama",
+  "diagnostics": [
+    {
+      "name": "near-gaussian ablation, seed 2 baseline",
+      "status": "closed, local result",
+      "scope": "absgs-base-seed2 only, validation panorama R0010011, checkpoint step_003000 (vs step_002000)",
+      "finding": "removing, in memory and per face, Gaussians whose oriented 3-sigma depth extent comes near the camera changes the validation metrics of these faces: an effect of removal is shown",
+      "not_shown": "why these Gaussians grew; any generalisation to other seeds, panoramas or checkpoints",
+      "caveat": "each ablation removes a different set per face: it is not a single cleaned model",
+      "consequence": "seed 2 and all checkpoints stay in the comparison; no code or data defect is established; a separate correction experiment defines one rule from training views"
+    }
+  ]
 }
