@@ -100,6 +100,9 @@ Autorisation : entraînement de recherche évalué selon le protocole AUTO-05. L
 - Masques : les statistiques SSIM ne portent que sur les pixels valides ; modifier un pixel exclu ne change ni la perte, ni son gradient, ni les métriques. Une vue sans pixel valide est refusée à l’entraînement et exclue des moyennes d’évaluation (listée, jamais 100 dB) ; sans vue de validation exploitable, la sélection est refusée. Le degré d’harmoniques sphériques réellement utilisé est enregistré dans chaque checkpoint et réutilisé à l’évaluation.
 - Checkpoints reprenables (`--resume`) : paramètres, optimiseurs, planificateur, état de densification, générateurs aléatoires ; reprise refusée si configuration, entrées, partition ou commit diffèrent. Journaux : `train.jsonl`, `validation.jsonl`, `training.json`.
 
+- Inspection (validation seulement, lecture seule) : `python -m theta_pipeline.gsplat_inspect --prep <run> --config <config>` exporte, pour chaque face de validation du checkpoint sélectionné, référence, rendu, poids, carte d’erreur, alpha et profondeur, avec métriques par face et par région (vitrage, miroir, reflets non validés, contours, autres) et des statistiques de gaussiennes (grandes, hors de la boîte des points SfM) pour repérer les flottants. Sortie : `<run>/inspection/<config>-validation-<checkpoint>/inspection.md`.
+- `configs/gsplat-l4-10k.json` (`l4-10k-001`) : nouvel entraînement de 10 000 itérations, calendrier explicite dans la clé `schedule`. Nouveau nom, donc nouveau dossier : il ne reprend jamais l’essai court. Remarque : dans gsplat 1.5.3, la réinitialisation d’opacité ne se déclenche jamais, et l’élagage des grandes gaussiennes n’agit qu’entre `reset_every` et `refine_stop_iter`.
+
 ```sh
 # VM : environnement gsplat
 uv python install 3.10.22

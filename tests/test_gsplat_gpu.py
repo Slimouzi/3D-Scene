@@ -55,6 +55,20 @@ class GsplatGpu(unittest.TestCase):
         # Version checks and `import gsplat` miss backend dependencies: a CUDA render must succeed.
         self.assertIn('render_probe', result['found'])
 
+    def test_render_mode_used_by_inspection(self):
+        import torch
+        from gsplat import rasterization
+        d = 'cuda'
+        renders, alphas, _ = rasterization(
+            means=torch.tensor([[0., 0., 2.]], device=d), quats=torch.tensor([[1., 0., 0., 0.]], device=d),
+            scales=torch.full((1, 3), .2, device=d), opacities=torch.tensor([.9], device=d),
+            colors=torch.tensor([[1., 0., 0.]], device=d), viewmats=torch.eye(4, device=d)[None],
+            Ks=torch.tensor([[[8., 0., 4.], [0., 8., 4.], [0., 0., 1.]]], device=d), width=8, height=8,
+            render_mode='RGB+ED')
+        self.assertEqual(tuple(renders.shape), (1, 8, 8, 4))
+        self.assertAlmostEqual(float(renders[0, 4, 4, 3]), 2., delta=.3)     # expected depth
+        self.assertGreater(float(alphas[0, 4, 4, 0]), .5)
+
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train
         rng = np.random.default_rng(0)
