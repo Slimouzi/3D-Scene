@@ -34,7 +34,10 @@ from .storage import digest, now, read, write
 METHOD = 'auto05-hull-maxmin-v1'
 DEFAULTS = {'test_fraction': 0.15, 'validation_fraction': 0.10, 'neighbors_k': 4,
             'min_train_neighbors': 2, 'min_train_panoramas': 3, 'max_combinations': 200_000,
-            'expected_partition_sha256': None}
+            'expected_partition_sha256': None,
+            # Extension of a frozen split (method auto05-extend-validation-v1); unused when base_split_run is None.
+            'base_split_run': None, 'base_partition_sha256': None, 'fixed_test': None, 'add_validation': 0}
+METHOD_EXTEND = 'auto05-extend-validation-v1'
 SETS = ('train', 'validation', 'test')
 STAGES = ('import_sfm', 'auto_split', 'split_gates', 'split_report')
 
@@ -179,6 +182,93 @@ def propose(centers, edges, p):
             'hull_vertices': sorted(vertices), 'layout': layout,
             'min_heldout_distance_rms_units': round(spread, 6),
             'admissible_sets': total - rejected, 'evaluated_sets': total}
+
+
+def extend(centers, edges, p, base):
+    """Move exactly `add_validation` train panoramas of a frozen split to validation.
+
+    Test and existing validation are kept. Candidates are interior train panoramas (hull
+    vertices stay in train); the moved set must keep every held-out panorama admissible
+    (train neighbours, inside the train hull, covisible with train, connected train graph).
+    Among admissible sets the one farthest from the existing held-out panoramas wins
+    (maximal minimum distance), ties by sorted ids. Pure and deterministic.
+    """
+    ids = sorted(centers)
+    edges = {tuple(sorted(e)) for e in edges}
+    count = p['add_validation']
+    out = {'method': METHOD_EXTEND, 'parameters': p, 'panoramas': ids,
+           'base': {'split_run': p['base_split_run'], 'partition_sha256': base.get('partition_sha256'),
+                    **{name: sorted(base[name]) for name in SETS}}}
+    if count < 1:
+        return {**out, 'status': 'unknown', 'reasons': ['add_validation must be at least 1']}
+    if sorted(set().union(*(base[name] for name in SETS))) != ids:
+        return {**out, 'status': 'unknown', 'reasons': ['base split does not cover the reconstructed panoramas']}
+    xy = plane(centers)
+    vertices = hull(xy)
+    held = sorted(base['validation'] + base['test'])
+    candidates = [i for i in sorted(base['train']) if i not in vertices]
+    if len(base['train']) - count < p['min_train_panoramas']:
+        return {**out, 'status': 'unknown', 'reasons': ['too few train panoramas would remain']}
+    best = None
+    for moved in combinations(candidates, count):
+        if admissible(tuple(held) + moved, ids, xy, edges, p):
+            continue
+        spread = min(float(np.linalg.norm(xy[m] - xy[h])) for m in moved for h in held)
+        key = (-round(spread, 9), moved)
+        if best is None or key < best[0]:
+            best = (key, moved, spread)
+    layout = {i: [round(float(v), 6) for v in xy[i]] for i in ids}
+    if best is None:
+        return {**out, 'status': 'unknown', 'hull_vertices': sorted(vertices), 'layout': layout,
+                'reasons': ['no interior train panorama can move to validation under the coverage constraints']}
+    _, moved, spread = best
+    return {**out, 'status': 'proposed', 'moved_to_validation': list(moved),
+            'train': sorted(set(base['train']) - set(moved)),
+            'validation': sorted(base['validation'] + list(moved)), 'test': sorted(base['test']),
+            'counts': {'train': len(base['train']) - count, 'validation': len(base['validation']) + count,
+                       'test': len(base['test'])},
+            'hull_vertices': sorted(vertices), 'layout': layout,
+            'min_distance_to_existing_heldout_rms_units': round(spread, 6)}
+
+
+def extension_checks(base, sets, p):
+    """The extension changes nothing but the moved panoramas."""
+    fixed = sorted(p['fixed_test'] or [])
+    moved = sorted(set(sets['validation']) - set(base['validation']))
+    return [
+        check('test_fixed', sorted(sets['test']) == fixed == sorted(base['test']),
+              {'test': sorted(sets['test']), 'fixed_test': fixed, 'base_test': sorted(base['test'])}),
+        check('validation_extends_base', set(base['validation']) <= set(sets['validation'])
+              and len(moved) == p['add_validation'] and set(moved) <= set(base['train']),
+              {'kept': sorted(base['validation']), 'moved_from_train': moved}),
+        check('train_is_base_minus_moved', sorted(sets['train']) == sorted(set(base['train']) - set(moved)),
+              {'train': len(sets['train']), 'base_train': len(base['train'])}),
+        check('test_validation_disjoint', not set(sets['test']) & set(sets['validation']), 'no shared panorama'),
+    ]
+
+
+def base_split(run, p):
+    """The frozen base split, read only and hash-verified against its run.json."""
+    source = run.path.parent / p['base_split_run']
+    entry = read(source / 'run.json')['stages'].get('auto_split', {})
+    if entry.get('status') != 'completed' or digest(source / 'split.json') != entry['artifacts'].get('split.json'):
+        raise RuntimeError(f"{p['base_split_run']}/split.json changed, missing or incomplete")
+    base = read(source / 'split.json')
+    problems = []
+    if base.get('status') != 'frozen':
+        problems.append(f"base split is {base.get('status')}, not frozen")
+    if not p['base_partition_sha256'] or base.get('partition_sha256') != p['base_partition_sha256']:
+        problems.append(f"base partition {base.get('partition_sha256')} != pinned {p['base_partition_sha256']}")
+    if partition_sha256({n: base[n] for n in SETS}) != base.get('partition_sha256'):
+        problems.append('base split lists do not match their recorded hash')
+    if sorted(base.get('test') or []) != sorted(p['fixed_test'] or []):
+        problems.append(f"base test {base.get('test')} != fixed_test {p['fixed_test']}")
+    for key in ('sfm_run', 'semantic_run'):
+        if base.get(key) != run.config.get(key):
+            problems.append(f'base {key} {base.get(key)} != config {run.config.get(key)}')
+    if problems:
+        raise RuntimeError('; '.join(problems))
+    return base
 
 
 def face_assignment(sets, views):
@@ -402,9 +492,12 @@ def auto_split(run):
              if e['inlier_observations'] > 0]
     expected = [s.stem for s in run.sources]
     commit = git_commit()
-    proposal = (propose(centers, edges, p) if source_checks[2]['result'] == 'PASS'
-                else {'status': 'unknown', 'method': METHOD, 'parameters': p,
-                      'reasons': ['reconstructed positions missing for some panoramas']})
+    base = base_split(run, p) if p['base_split_run'] else None
+    if source_checks[2]['result'] != 'PASS':
+        proposal = {'status': 'unknown', 'method': METHOD_EXTEND if base else METHOD, 'parameters': p,
+                    'reasons': ['reconstructed positions missing for some panoramas']}
+    else:
+        proposal = extend(centers, edges, p, base) if base else propose(centers, edges, p)
     split = {'schema_version': 2, 'unit': 'panorama', 'seed': run.config['seed'], 'randomness': 'none',
              'sfm_run': run.config['sfm_run'], 'semantic_run': run.config['semantic_run'],
              'poses_sha256': poses_sha256, 'git_commit': commit, **proposal}
@@ -423,6 +516,8 @@ def auto_split(run):
         inputs = train_inputs(sets, views, tracks, sfm_run, semantic_run, output_root, recorded)
         write(inputs_path, inputs)
         checks += validate(split, expected, poses_sha256, views)
+        if base:
+            checks += extension_checks(base, sets, p)
         checks += separation_checks(sets, inputs, views, tracks, sfm_run, semantic_run)
         checks.append(verify_train_files(inputs, output_root))
         pinned = p['expected_partition_sha256']
@@ -532,6 +627,10 @@ def split_report(run):
              '(artefacts importés après vérification des empreintes, non réexécutés).',
              f"Commit : `{split['git_commit']}`. Empreinte des poses : `{split['poses_sha256']}`.",
              f"Empreinte de la partition : `{split.get('partition_sha256')}`.", '',
+             *([f"Extension de `{split['base']['split_run']}` (`{split['base']['partition_sha256']}`) : test conservé "
+                f"({', '.join(split['base']['test'])}), passage en validation : "
+                f"{', '.join(split.get('moved_to_validation') or ['aucun'])}.", '']
+               if split.get('base') else []),
              '| Ensemble | Panoramas |', '|---|---|']
     for name in SETS:
         lines.append(f"| {name} | {', '.join(split.get(name) or []) or '—'} |")

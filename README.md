@@ -89,6 +89,14 @@ Artefacts : `split.json` (ensembles, méthode `auto05-hull-maxmin-v1`, paramètr
 - `gsplat_allowed.exploratory` : masques acceptés et poses disponibles ; aucune métrique réservée. `gsplat_allowed.evaluated` : en plus, partition figée revalidée et séparation des données vérifiée.
 - Les poses des vues réservées proviennent du SfM conjoint sur les 13 panoramas ; le rapport le déclare. `j1_passed`, navigation et livraison produit restent inchangés / UNKNOWN.
 
+### Seconde vue de validation (extension AUTO-05)
+
+`configs/salon-split-v2.json` étend la partition figée `salon-split-005` (`3949e717…aaae`) sans la modifier : le test reste R0010008 et R0010014 (vérifié contre la base et la configuration), la validation R0010006 est conservée, et exactement un panorama d’entraînement intérieur passe en validation (méthode `auto05-extend-validation-v1` : admissibilité inchangée, le plus éloigné des vues déjà réservées, sans tirage). La nouvelle partition reçoit sa propre empreinte ; une fois validée, elle sera fixée dans une configuration suivante.
+
+```sh
+.venv-sfm/bin/python -m theta_pipeline split --config configs/salon-split-v2.json --run-id salon-split-006
+```
+
 ## Entraînement gsplat évalué
 
 Autorisation : entraînement de recherche évalué selon le protocole AUTO-05. Limite déclarée dans chaque manifeste : poses et positions initiales viennent du SfM masqué conjoint des 13 panoramas, vues réservées comprises. Navigation et livraison produit : non validées.

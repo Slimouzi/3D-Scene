@@ -340,3 +340,119 @@ class SplitExperimentTests(SplitFixture):
             run.stage('audit', stages.audit)
             with self.assertRaisesRegex(RuntimeError, 'changed'):
                 run.stage('import_sfm', split.import_sfm, requires=('audit',))
+
+
+class ExtendValidationTests(unittest.TestCase):
+    """AUTO-05 extension: fixed test, exactly one train panorama moved to validation."""
+
+    def setUp(self):
+        edges = neighbour_edges(CENTERS)
+        base = split.propose(CENTERS, edges, split.DEFAULTS)
+        self.base = {name: base[name] for name in split.SETS}
+        self.base['partition_sha256'] = split.partition_sha256(self.base)
+        self.edges = edges
+        self.p = {**split.DEFAULTS, 'base_split_run': 'base', 'base_partition_sha256': self.base['partition_sha256'],
+                  'fixed_test': self.base['test'], 'add_validation': 1}
+
+    def test_counts_disjoint_and_fixed_test(self):
+        result = split.extend(CENTERS, self.edges, self.p, self.base)
+        self.assertEqual(result['status'], 'proposed')
+        self.assertEqual(result['test'], sorted(self.base['test']))
+        self.assertEqual([len(result[n]) for n in split.SETS], [9, 2, 2])
+        self.assertFalse(set(result['test']) & set(result['validation']))
+        moved = result['moved_to_validation']
+        self.assertEqual(len(moved), 1)
+        self.assertIn(moved[0], self.base['train'])
+        self.assertNotIn(moved[0], result['hull_vertices'])
+        self.assertEqual(sorted(sum((result[n] for n in split.SETS), [])), sorted(CENTERS))
+        checks = split.extension_checks(self.base, {n: result[n] for n in split.SETS}, self.p)
+        self.assertEqual({c['result'] for c in checks}, {'PASS'})
+
+    def test_reproducible_under_order_and_scale(self):
+        expected = split.extend(CENTERS, self.edges, self.p, self.base)
+        for seed in range(4):
+            items = list(CENTERS.items())
+            random.Random(seed).shuffle(items)
+            edges = [e[::-1] for e in self.edges]
+            random.Random(seed).shuffle(edges)
+            scaled = {k: list(np.multiply(v, 12.5) + [1, 2, 3]) for k, v in items}
+            result = split.extend(scaled, edges, self.p, self.base)
+            self.assertEqual({n: result[n] for n in split.SETS}, {n: expected[n] for n in split.SETS})
+
+    def test_wrong_test_or_count_is_rejected(self):
+        self.assertEqual(split.extend(CENTERS, self.edges, {**self.p, 'add_validation': 0}, self.base)['status'],
+                         'unknown')
+        result = split.extend(CENTERS, self.edges, self.p, self.base)
+        sets = {n: result[n] for n in split.SETS}
+        moved_twice = {**sets, 'validation': sets['validation'] + sets['train'][:1], 'train': sets['train'][1:]}
+        checks = {c['name']: c['result'] for c in split.extension_checks(self.base, moved_twice, self.p)}
+        self.assertEqual(checks['validation_extends_base'], 'FAIL')
+        changed_test = {**sets, 'test': sets['test'][:1] + sets['train'][:1], 'train': sets['train'][1:]}
+        checks = {c['name']: c['result'] for c in split.extension_checks(self.base, changed_test, self.p)}
+        self.assertEqual(checks['test_fixed'], 'FAIL')
+
+    def test_versioned_configs(self):
+        root = Path(__file__).resolve().parents[1] / 'configs'
+        import json
+        original = json.loads((root / 'salon-split.json').read_text())
+        self.assertEqual(original['split'], {'test_fraction': 0.15, 'validation_fraction': 0.1, 'neighbors_k': 4,
+                                             'min_train_neighbors': 2, 'expected_partition_sha256': None})
+        v2 = json.loads((root / 'salon-split-v2.json').read_text())
+        self.assertEqual(v2['split']['base_split_run'], 'salon-split-005')
+        self.assertEqual(v2['split']['base_partition_sha256'],
+                         '3949e717cb4d730c77ba302c3974224462e33425fd18e89a67afaea88291aaae')
+        self.assertEqual(v2['split']['fixed_test'], ['R0010008', 'R0010014'])
+        self.assertEqual(v2['split']['add_validation'], 1)
+        self.assertEqual({k: v for k, v in v2.items() if k != 'split'},
+                         {k: v for k, v in original.items() if k != 'split'})
+
+
+class ExtendExperimentTests(SplitFixture):
+    """Extension end to end; the base split run is never modified."""
+
+    def snapshot(self, folder):
+        from theta_pipeline.storage import digest
+        return {str(p.relative_to(folder)): digest(p) for p in sorted(folder.rglob('*')) if p.is_file()}
+
+    def base_run(self):
+        from theta_pipeline.storage import Run
+        with Run(self.config, 'exp').locked() as run:
+            self.run_split(run)
+        return read(self.root / 'runs/exp/split.json')
+
+    def extension_config(self, base, **changes):
+        write(self.root / 'ext.json', {**self.base, 'semantic_run': 'sem', 'sfm_run': 'sfm', 'split': {
+            'base_split_run': 'exp', 'base_partition_sha256': base['partition_sha256'],
+            'fixed_test': base['test'], 'add_validation': 1, **changes}})
+        return self.root / 'ext.json'
+
+    def test_extension_freezes_and_leaves_base_untouched(self):
+        from theta_pipeline.storage import Run
+        base = self.base_run()
+        self.assertEqual(base['status'], 'frozen')
+        before = self.snapshot(self.root / 'runs/exp')
+        with Run(self.extension_config(base), 'ext').locked() as run:
+            self.run_split(run)
+            record = read(run.path / 'split.json')
+        self.assertEqual(record['status'], 'frozen', record['checks'])
+        self.assertEqual(record['method'], split.METHOD_EXTEND)
+        self.assertEqual(record['test'], sorted(base['test']))
+        self.assertEqual(len(record['validation']), len(base['validation']) + 1)
+        self.assertNotEqual(record['partition_sha256'], base['partition_sha256'])
+        self.assertEqual(record['base']['partition_sha256'], base['partition_sha256'])
+        self.assertEqual(self.snapshot(self.root / 'runs/exp'), before)
+
+    def test_mismatched_base_or_test_refused(self):
+        from theta_pipeline.storage import Run
+        base = self.base_run()
+        before = self.snapshot(self.root / 'runs/exp')
+        for name, changes, message in (('h', {'base_partition_sha256': '0' * 64}, 'pinned'),
+                                       ('t', {'fixed_test': base['train'][:2]}, 'fixed_test')):
+            with Run(self.extension_config(base, **changes), name).locked() as run:
+                from theta_pipeline import stages
+                run.stage('audit', stages.audit)
+                run.stage('auto_mask', stages.auto_mask, requires=('audit',))
+                run.stage('import_sfm', split.import_sfm, requires=('audit',))
+                with self.assertRaisesRegex(RuntimeError, message):
+                    run.stage('auto_split', split.auto_split, requires=('auto_mask', 'import_sfm'))
+        self.assertEqual(self.snapshot(self.root / 'runs/exp'), before)
