@@ -52,6 +52,8 @@ class GsplatGpu(unittest.TestCase):
     def test_environment_matches_lock(self):
         result = qualify()
         self.assertTrue(result['qualified'], result['problems'])
+        # Version checks and `import gsplat` miss backend dependencies: a CUDA render must succeed.
+        self.assertIn('render_probe', result['found'])
 
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train

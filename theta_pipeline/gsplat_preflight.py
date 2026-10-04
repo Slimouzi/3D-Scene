@@ -22,6 +22,23 @@ def pins(path=LOCK):
     return {**header, 'numpy': re.search(r'^numpy==(\S+)$', text, re.M).group(1)}
 
 
+def render_probe():
+    """Rasterize one red Gaussian in front of an 8x8 camera on CUDA; checks the center pixel."""
+    import torch
+    from gsplat import rasterization
+    d = 'cuda'
+    renders, alphas, _ = rasterization(
+        means=torch.tensor([[0., 0., 2.]], device=d), quats=torch.tensor([[1., 0., 0., 0.]], device=d),
+        scales=torch.full((1, 3), .2, device=d), opacities=torch.tensor([.9], device=d),
+        colors=torch.tensor([[1., 0., 0.]], device=d), viewmats=torch.eye(4, device=d)[None],
+        Ks=torch.tensor([[[8., 0., 4.], [0., 8., 4.], [0., 0., 1.]]], device=d), width=8, height=8)
+    torch.cuda.synchronize()
+    center = renders[0, 4, 4].tolist()
+    if not (alphas[0, 4, 4, 0] > .5 and center[0] > .5 and center[1] < .1 and center[2] < .1):
+        raise RuntimeError(f'unexpected probe render: rgb {center}, alpha {float(alphas[0, 4, 4, 0])}')
+    return {'center_rgb': [round(v, 4) for v in center], 'alpha': round(float(alphas[0, 4, 4, 0]), 4)}
+
+
 def qualify(path=LOCK):
     expected = pins(path)
     found = {'python': platform.python_version(), 'platform': f'{platform.system()} {platform.machine()}'}
@@ -42,6 +59,14 @@ def qualify(path=LOCK):
         from gsplat import rasterization  # noqa: F401
     except Exception as error:
         problems.append(f'gsplat import failed: {error}')
+    else:
+        # Importing gsplat does not load its CUDA backend (packaging, setuptools, csrc):
+        # only a real render proves the environment can train.
+        if found['cuda_available']:
+            try:
+                found['render_probe'] = render_probe()
+            except Exception as error:
+                problems.append(f'gsplat CUDA render failed: {type(error).__name__}: {error}')
     if found['platform'] != 'Linux x86_64':
         problems.append(f"platform {found['platform']} is not Linux x86_64")
     if not found['cuda_available']:
