@@ -1,12 +1,14 @@
-"""Visual inspection of a selected gsplat checkpoint on validation views only (GPU VM).
+"""Visual inspection of a selected gsplat checkpoint (GPU VM), never the test set.
 
     python -m theta_pipeline.gsplat_inspect --prep Output/runs/<prep-run> --config configs/<training>.json
 
-Read-only: writes under <prep-run>/inspection/<training>-validation-<checkpoint>/ and never
-touches the training directory. The test set is never loaded. For each validation face:
-reference, render, weight mask, error map, alpha and expected depth, plus metrics per face
-and per region (glass, mirror, unvalidated reflective, contours, other). Gaussian
-population statistics help spot floaters. Nothing is judged: no quality threshold.
+Writes under <prep-run>/inspection/<training>-<checkpoint>-v2/ and never touches the
+training directory. The selected checkpoint is copied; renders read the copy only, and
+the original's SHA-256 is checked before and after. Exported for validation faces and for
+train faces chosen by glass-window and furniture content, in two variants (full model,
+and without Gaussians larger than prune_scale3d x scene_scale): reference, render, weight
+mask, error map, alpha and expected depth, metrics per face and per region. Gaussians
+outside the SfM point box are reported, never removed. No quality threshold.
 """
 import argparse
 import json
@@ -20,7 +22,9 @@ from .segmentation.provenance import git_commit
 from .storage import digest, now, read, write
 
 REGIONS = {'glass': (LABELS['glass'],), 'mirror': (LABELS['mirror'],),
-           'unvalidated_reflective': (LABELS['unknown_glass'], LABELS['unknown_reflective'])}
+           'unvalidated_reflective': (LABELS['unknown_glass'], LABELS['unknown_reflective']),
+           'furniture': (LABELS['furniture'],)}
+SELECTION = {'glass_windows': (LABELS['glass'], LABELS['unknown_glass']), 'furniture': (LABELS['furniture'],)}
 
 
 def face_directions(size, rotation):
@@ -89,9 +93,17 @@ def depth_image(depth, alpha):
     return out
 
 
+def large_gaussians(scales, scene_scale, prune_scale3d):
+    """Gaussians whose largest axis exceeds prune_scale3d x scene_scale (gsplat's pruning rule)."""
+    return scales.max(1) > prune_scale3d * scene_scale
+
+
 def gaussian_statistics(means, scales, opacities, points_xyz, scene_scale, prune_scale3d):
-    """Population descriptors for floater review (no threshold is turned into a verdict)."""
-    size = scales.max(1)
+    """Population descriptors for floater review (no threshold is turned into a verdict).
+
+    Sizes are reported normalized by scene_scale, the unit of gsplat's prune_scale3d.
+    """
+    size = scales.max(1) / scene_scale
     low, high = points_xyz.min(0), points_xyz.max(0)
     margin = .25 * (high - low)
     outside = ((means < low - margin) | (means > high + margin)).any(1)
@@ -99,7 +111,8 @@ def gaussian_statistics(means, scales, opacities, points_xyz, scene_scale, prune
             'opacity_quantiles': dict(zip(('p05', 'p50', 'p95'), np.quantile(opacities, [.05, .5, .95]).round(4).tolist())),
             'max_scale_over_scene_scale_quantiles': dict(zip(
                 ('p50', 'p95', 'p99', 'max'), (np.quantile(size, [.5, .95, .99]).tolist() + [float(size.max())]))),
-            'larger_than_prune_scale3d': int((size > prune_scale3d * scene_scale).sum()),
+            'scene_scale': float(scene_scale), 'prune_scale3d': float(prune_scale3d),
+            'larger_than_prune_scale3d': int(large_gaussians(scales, scene_scale, prune_scale3d).sum()),
             'outside_sfm_points_box_plus_25pct': int(outside.sum()),
             'outside_and_opaque_over_0_5': int((outside & (opacities > .5)).sum())}
 
@@ -118,9 +131,112 @@ def contact_sheet(name, panels, metrics):
     return sheet
 
 
-def inspect(prep, cfg):
+def select_train_faces(cameras, labels_for, rotations, size, per_group=3):
+    """Deterministic train faces showing most glass windows and most furniture (ties by name)."""
+    fractions = {}
+    for camera in cameras:
+        labels = project_labels(labels_for(camera['panorama_id']), rotations[camera['name']], size)
+        fractions[camera['name']] = {g: float(np.isin(labels, codes).mean()) for g, codes in SELECTION.items()}
+    chosen = []
+    for group in SELECTION:
+        ranked = sorted(fractions, key=lambda n: (-fractions[n][group], n))
+        chosen += [n for n in ranked if n not in chosen and fractions[n][group] > 0][:per_group]
+    return chosen, {n: fractions[n] for n in chosen}
+
+
+class Sources:
+    """Hash-verified face rotations (split run) and semantic labels (semantic run)."""
+
+    def __init__(self, output, manifest):
+        self.output = output
+        split_run = output / manifest['split_run']
+        rel = 'sfm_import/views.json'
+        if digest(split_run / rel) != read(split_run / 'run.json')['stages']['import_sfm']['artifacts'][rel]:
+            raise RuntimeError(f'{split_run.name}/{rel} changed')
+        self.rotations = {v['sfm_name']: np.asarray(v['T_face_from_panorama'])[:3, :3]
+                          for v in read(split_run / rel)['views']}
+        self.semantic = manifest['semantic_run']
+        self.recorded = read(output / self.semantic / 'run.json')['stages']['auto_mask']['artifacts']
+        self.cache = {}
+
+    def labels(self, pano):
+        if pano not in self.cache:
+            rel = f'segmentation/fused/{pano}/labels.png'
+            path = load_verified(self.output, {'path': f'{self.semantic}/{rel}', 'sha256': self.recorded.get(rel)})
+            self.cache[pano] = np.asarray(Image.open(path))
+        return self.cache[pano]
+
+
+def render_face(params, data, i, degree):
     import torch
     from gsplat import rasterization
+    with torch.no_grad():
+        renders, alphas, _ = rasterization(
+            means=params['means'], quats=params['quats'], scales=torch.exp(params['scales']),
+            opacities=torch.sigmoid(params['opacities']), colors=torch.cat([params['sh0'], params['shN']], 1),
+            viewmats=data['viewmats'][i:i + 1], Ks=data['Ks'][i:i + 1], width=data['width'],
+            height=data['height'], sh_degree=degree, packed=False, render_mode='RGB+ED')
+    return renders[0, ..., :3].clamp(0, 1), alphas[0, ..., 0], renders[0, ..., 3]
+
+
+def export_faces(target, cameras, data, params, degree, sources):
+    from . import gsplat_train
+    faces = []
+    for i, camera in enumerate(cameras):
+        rgb, alpha, depth = render_face(params, data, i, degree)
+        metrics = gsplat_train.view_metrics(rgb[None], data['images'][i:i + 1].float() / 255,
+                                            data['weights'][i:i + 1].float() / 255)
+        reference = data['images'][i].cpu().numpy()
+        rendered_float = rgb.cpu().numpy() * 255          # metrics use the unquantized render
+        rendered = rendered_float.round().astype(np.uint8)
+        weight = data['weights'][i].float().cpu().numpy() / 255
+        alpha, depth = alpha.cpu().numpy(), depth.cpu().numpy()
+        labels = project_labels(sources.labels(camera['panorama_id']), sources.rotations[camera['name']],
+                                data['width'])
+        valid = weight > 0
+        regions = {name: np.isin(labels, codes) for name, codes in REGIONS.items()}
+        regions['contours'] = contour_mask(reference, valid)
+        regions['other'] = valid & ~np.logical_or.reduce(list(regions.values()))
+        stem = camera['name'].replace('/', '__').removesuffix('.png')
+        panels = [('reference', reference), ('render', rendered), ('weights', (weight * 255).astype(np.uint8)),
+                  ('error', error_image(reference, rendered_float, weight)), ('alpha', (alpha * 255).astype(np.uint8)),
+                  ('depth', depth_image(depth, alpha))]
+        files = {}
+        for label, array in panels:
+            path = target / stem / f'{label}.png'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(array).save(path)
+            files[label] = str(path.relative_to(target))
+        sheet = target / f'{stem}.jpg'
+        contact_sheet(camera['name'], panels, {k: None if metrics[k] is None else round(metrics[k], 3)
+                                               for k in ('psnr', 'ssim')}).save(sheet, quality=90)
+        faces.append({'camera': camera['name'], 'panorama_id': camera['panorama_id'], **metrics,
+                      'low_alpha_fraction_of_valid': float(((alpha < .5) & valid).sum() / max(valid.sum(), 1)),
+                      'regions': region_metrics(reference, rendered_float, weight, regions),
+                      'files': files, 'contact_sheet': sheet.name})
+    return faces
+
+
+def summarize(faces):
+    usable = [f for f in faces if not f['excluded']]
+    regions = {}
+    for name in [*REGIONS, 'contours', 'other']:
+        values = [f['regions'][name]['psnr'] for f in usable if f['regions'][name]['psnr'] is not None]
+        regions[name] = float(np.mean(values)) if values else None
+    return {'faces': len(faces), 'usable_faces': len(usable),
+            'mean_psnr': float(np.mean([f['psnr'] for f in usable])) if usable else None,
+            'mean_ssim': float(np.mean([f['ssim'] for f in usable])) if usable else None,
+            'mean_region_psnr': regions}
+
+
+def inspect(prep, cfg, train_faces=3):
+    """Validation faces and selected train faces, with and without large Gaussians.
+
+    The selected checkpoint is copied; only the copy is read and filtered. The original
+    file hash is checked before and after. Out-of-box Gaussians are reported, never removed.
+    """
+    import shutil
+    import torch
     from . import gsplat_train
     prep = Path(prep).resolve()
     output = prep.parent
@@ -133,134 +249,122 @@ def inspect(prep, cfg):
     if status['status'] != 'completed':
         raise RuntimeError(f"training {cfg['name']} is {status['status']}")
     selection = read(training / 'selection.json')
-    checkpoint = training / 'checkpoints' / selection['checkpoint']
+    original = training / 'checkpoints' / selection['checkpoint']
+    original_sha = digest(original)
+    root = prep / 'inspection' / f"{cfg['name']}-{original.stem}-v2"
+    copy = root / 'checkpoint_copy' / original.name
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(original, copy)
+    if digest(copy) != original_sha:
+        raise RuntimeError('checkpoint copy differs from the original')
     manifest = read(prep / 'gsplat_inputs/gsplat_inputs.json')
     meta = {'config_sha256': gsplat_train.config_sha256(cfg),
             'manifest_sha256': digest(prep / 'gsplat_inputs/gsplat_inputs.json'),
             'partition_sha256': manifest['partition_sha256'], 'git_commit': status['git_commit']}
-    _, params, *_, saved = gsplat_train.restore(checkpoint, cfg, meta, 'cuda')
-    degree = saved['sh_degree']
-    data = gsplat_train.load_cameras(prep, 'validation', 'cuda')
-    # Face orientation and semantic labels, hash-verified against their source runs.
-    split_run = output / manifest['split_run']
-    views_rel = 'sfm_import/views.json'
-    if digest(split_run / views_rel) != read(split_run / 'run.json')['stages']['import_sfm']['artifacts'][views_rel]:
-        raise RuntimeError(f'{split_run.name}/{views_rel} changed')
-    rotations = {v['sfm_name']: np.asarray(v['T_face_from_panorama'])[:3, :3]
-                 for v in read(split_run / views_rel)['views']}
-    semantic = manifest['semantic_run']
-    recorded = read(output / semantic / 'run.json')['stages']['auto_mask']['artifacts']
-    cameras = read(prep / 'gsplat_inputs/cameras_validation.json')['cameras']
-    target = prep / 'inspection' / f"{cfg['name']}-validation-{checkpoint.stem}"
-    target.mkdir(parents=True, exist_ok=True)
-    labels_cache, faces = {}, []
-    for i, camera in enumerate(cameras):
-        pano = camera['panorama_id']
-        if pano not in labels_cache:
-            rel = f'segmentation/fused/{pano}/labels.png'
-            path = load_verified(output, {'path': f'{semantic}/{rel}', 'sha256': recorded.get(rel)})
-            labels_cache[pano] = np.asarray(Image.open(path))
-        with torch.no_grad():
-            colors = torch.cat([params['sh0'], params['shN']], 1)
-            renders, alphas, _ = rasterization(
-                means=params['means'], quats=params['quats'], scales=torch.exp(params['scales']),
-                opacities=torch.sigmoid(params['opacities']), colors=colors,
-                viewmats=data['viewmats'][i:i + 1], Ks=data['Ks'][i:i + 1], width=data['width'],
-                height=data['height'], sh_degree=degree, packed=False, render_mode='RGB+ED')
-        rgb = renders[0, ..., :3].clamp(0, 1)
-        metrics = gsplat_train.view_metrics(rgb[None], data['images'][i:i + 1].float() / 255,
-                                            data['weights'][i:i + 1].float() / 255)
-        reference = data['images'][i].cpu().numpy()
-        rendered = (rgb.cpu().numpy() * 255).round().astype(np.uint8)
-        weight = data['weights'][i].float().cpu().numpy() / 255
-        alpha = alphas[0, ..., 0].cpu().numpy()
-        depth = renders[0, ..., 3].cpu().numpy()
-        labels = project_labels(labels_cache[pano], rotations[camera['name']], data['width'])
-        valid = weight > 0
-        regions = {name: np.isin(labels, codes) for name, codes in REGIONS.items()}
-        regions['contours'] = contour_mask(reference, valid)
-        regions['other'] = valid & ~np.logical_or.reduce(list(regions.values()))
-        stem = camera['name'].replace('/', '__').removesuffix('.png')
-        panels = [('reference', reference), ('render', rendered), ('weights', (weight * 255).astype(np.uint8)),
-                  ('error', error_image(reference, rendered, weight)), ('alpha', (alpha * 255).astype(np.uint8)),
-                  ('depth', depth_image(depth, alpha))]
-        files = {}
-        for label, array in panels:
-            path = target / stem / f'{label}.png'
-            path.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(array).save(path)
-            files[label] = str(path.relative_to(target))
-        sheet = target / f'{stem}.jpg'
-        contact_sheet(camera['name'], panels, {k: None if metrics[k] is None else round(metrics[k], 3)
-                                               for k in ('psnr', 'ssim')}).save(sheet, quality=90)
-        faces.append({'camera': camera['name'], 'panorama_id': pano, **metrics,
-                      'low_alpha_fraction_of_valid': float(((alpha < .5) & valid).sum() / max(valid.sum(), 1)),
-                      'regions': region_metrics(reference, rendered, weight, regions),
-                      'files': files, 'contact_sheet': sheet.name})
+    _, params, *_, saved = gsplat_train.restore(copy, cfg, meta, 'cuda')
+    degree, scale = saved['sh_degree'], saved['meta']['scene_scale']
+    prune = cfg['strategy'].get('prune_scale3d', .1)
+    large = large_gaussians(torch.exp(params['scales']).detach().cpu().numpy(), scale, prune)
+    keep = torch.from_numpy(~large).to(params['means'].device)
+    variants = {'full': params,
+                'without_large': {k: v.detach()[keep] for k, v in params.items()}}
+    torch.save({'source': original.name, 'source_sha256': original_sha, 'removed_large': int(large.sum()),
+                'rule': f'max axis > {prune} x scene_scale ({scale})',
+                'params': {k: v.cpu() for k, v in variants['without_large'].items()}},
+               root / 'checkpoint_copy' / 'without_large.pt')
+    sources = Sources(output, manifest)
+    train_cameras = read(prep / 'gsplat_inputs/cameras_train.json')['cameras']
+    chosen, chosen_fractions = select_train_faces(train_cameras, sources.labels, sources.rotations,
+                                                  train_cameras[0]['width'], train_faces)
+    groups = {'validation': read(prep / 'gsplat_inputs/cameras_validation.json')['cameras'],
+              'train': [c for c in train_cameras if c['name'] in chosen]}
     points = np.load(load_verified(output, {'path': next(r for r in manifest['files'] if r.endswith('points.npz')),
                                             'sha256': next(v for r, v in manifest['files'].items()
                                                            if r.endswith('points.npz'))}))
-    statistics = gaussian_statistics(params['means'].detach().cpu().numpy(),
-                                     torch.exp(params['scales']).detach().cpu().numpy(),
-                                     torch.sigmoid(params['opacities']).detach().cpu().numpy(),
-                                     points['xyz'], saved['meta']['scene_scale'],
-                                     cfg['strategy'].get('prune_scale3d', .1))
-    usable = [f for f in faces if not f['excluded']]
-    summary = {'schema_version': 1, 'set': 'validation', 'test_loaded': False,
-               'training': cfg['name'], 'checkpoint': checkpoint.name, 'step': saved['step'],
-               'sh_degree': degree, 'prep_run': prep.name, 'partition_sha256': manifest['partition_sha256'],
-               'checkpoint_git_commit': saved['meta']['git_commit'], 'inspection_git_commit': git_commit(),
-               'mean_psnr': float(np.mean([f['psnr'] for f in usable])) if usable else None,
-               'mean_ssim': float(np.mean([f['ssim'] for f in usable])) if usable else None,
-               'faces': faces, 'gaussians': statistics,
-               'regions_definition': {'glass/mirror/unvalidated_reflective': 'semantic labels of the '
-                                      'validation panorama projected per face (nearest)',
-                                      'contours': 'top 10% image-gradient magnitude among valid pixels',
-                                      'other': 'remaining valid pixels'},
-               'limitation': manifest['limitation'], 'quality_thresholds': 'none', 'created_at': now()}
-    write(target / 'inspection.json', summary)
-    write_report(target, summary)
-    return target
+    results = {}
+    for group, cameras in groups.items():
+        data = gsplat_train.load_cameras(prep, group, 'cuda', [c['name'] for c in cameras])
+        order = {name: k for k, name in enumerate(data['names'])}
+        cameras = sorted(cameras, key=lambda c: order[c['name']])
+        for variant, model in variants.items():
+            target = root / f'{group}-{variant}'
+            faces = export_faces(target, cameras, data, model, degree, sources)
+            results[(group, variant)] = {'summary': summarize(faces), 'faces': faces, 'target': target}
+            write(target / 'inspection.json', {'set': group, 'variant': variant, **summarize(faces), 'faces': faces})
+        del data
+        torch.cuda.empty_cache()
+    if digest(original) != original_sha:
+        raise RuntimeError('the original checkpoint changed during inspection')
+    summary = {
+        'schema_version': 2, 'training': cfg['name'], 'checkpoint': original.name,
+        'checkpoint_sha256': original_sha, 'original_unchanged': True, 'step': saved['step'],
+        'sh_degree': degree, 'prep_run': prep.name, 'partition_sha256': manifest['partition_sha256'],
+        'test_loaded': False, 'checkpoint_git_commit': saved['meta']['git_commit'],
+        'inspection_git_commit': git_commit(),
+        'train_faces': {'rule': f'top {train_faces} train faces by projected glass-window (validated + '
+                                f'unvalidated) fraction, then top {train_faces} by furniture fraction',
+                        'faces': chosen_fractions},
+        'gaussians': gaussian_statistics(params['means'].detach().cpu().numpy(),
+                                         torch.exp(params['scales']).detach().cpu().numpy(),
+                                         torch.sigmoid(params['opacities']).detach().cpu().numpy(),
+                                         points['xyz'], scale, prune),
+        'ablation': {'removed_large_gaussians': int(large.sum()), 'rule': f'max axis > {prune} x scene_scale',
+                     'out_of_box_gaussians': 'reported only, never removed'},
+        'results': {f'{g}/{v}': r['summary'] for (g, v), r in results.items()},
+        'limitation': manifest['limitation'], 'quality_thresholds': 'none', 'created_at': now()}
+    write(root / 'inspection.json', summary)
+    write_report(root, summary, results)
+    return root
 
 
-def write_report(target, summary):
-    lines = [f"# Inspection validation — {summary['training']} / {summary['checkpoint']}", '',
-             f"Étape {summary['step']}, degré SH {summary['sh_degree']}, partition `{summary['partition_sha256']}`. "
-             'Jeu de test non chargé.', '',
-             f"PSNR moyen {summary['mean_psnr']}, SSIM moyen {summary['mean_ssim']} (faces exploitables).", '',
-             '| Face | PSNR | SSIM | Vitrage | Miroir | Reflets non validés | Contours | Autres | Alpha < 0,5 |',
-             '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+def write_report(root, summary, results):
     fmt = lambda v: '—' if v is None else f'{v:.2f}'
-    for face in summary['faces']:
-        r = face['regions']
-        lines.append(f"| [{face['camera']}]({face['contact_sheet']}) | {fmt(face['psnr'])} | {fmt(face['ssim'])} | "
-                     + ' | '.join(fmt(r[k]['psnr']) for k in ('glass', 'mirror', 'unvalidated_reflective',
-                                                             'contours', 'other'))
-                     + f" | {face['low_alpha_fraction_of_valid']:.3f} |")
+    regions = [*REGIONS, 'contours', 'other']
     g = summary['gaussians']
-    lines += ['', 'Colonnes de régions : PSNR pondéré sur la région ; « — » si la région est absente de la face.', '',
-              '## Gaussiennes', '', f"- Nombre : {g['count']}",
-              f"- Opacité (p05/p50/p95) : {g['opacity_quantiles']}",
-              f"- Plus grand axe / échelle de scène : {g['max_scale_over_scene_scale_quantiles']}",
-              f"- Plus grandes que prune_scale3d : {g['larger_than_prune_scale3d']}",
+    lines = [f"# Inspection v2 — {summary['training']} / {summary['checkpoint']}", '',
+             f"Étape {summary['step']}, degré SH {summary['sh_degree']}. Original inchangé "
+             f"(`{summary['checkpoint_sha256'][:12]}`) ; rendus sur une copie. Jeu de test non chargé.", '',
+             '## Synthèse (PSNR pondéré moyen)', '',
+             '| Ensemble / variante | Faces | PSNR | SSIM | ' + ' | '.join(regions) + ' |',
+             '|---|---:|---:|---:|' + '---:|' * len(regions)]
+    for key, r in summary['results'].items():
+        lines.append(f"| {key} | {r['usable_faces']}/{r['faces']} | {fmt(r['mean_psnr'])} | {fmt(r['mean_ssim'])} | "
+                     + ' | '.join(fmt(r['mean_region_psnr'][k]) for k in regions) + ' |')
+    lines += ['', 'Train = faces apprises ; si le défaut y apparaît aussi, il ne vient pas de la généralisation.', '',
+              '## Effet du retrait des grandes gaussiennes, par face', '',
+              '| Ensemble | Face | PSNR complet | PSNR sans grandes | Écart |', '|---|---|---:|---:|---:|']
+    for group in ('validation', 'train'):
+        full = {f['camera']: f for f in results[(group, 'full')]['faces']}
+        for face in results[(group, 'without_large')]['faces']:
+            a, b = full[face['camera']]['psnr'], face['psnr']
+            delta = None if a is None or b is None else b - a
+            lines.append(f"| {group} | [{face['camera']}]({group}-without_large/{face['contact_sheet']}) | "
+                         f"{fmt(a)} | {fmt(b)} | {fmt(delta)} |")
+    lines += ['', '## Faces d’entraînement retenues', '']
+    lines += [f"- {n} : vitrage {v['glass_windows']:.3f}, mobilier {v['furniture']:.3f}"
+              for n, v in summary['train_faces']['faces'].items()]
+    lines += ['', '## Gaussiennes (tailles normalisées par scene_scale)', '', f"- Nombre : {g['count']}",
+              f"- scene_scale : {g['scene_scale']:.4f} ; seuil prune_scale3d : {g['prune_scale3d']}",
+              f"- Plus grand axe / scene_scale : {g['max_scale_over_scene_scale_quantiles']}",
+              f"- Au-delà du seuil (retirées dans la variante) : {g['larger_than_prune_scale3d']}",
               f"- Hors boîte des points SfM (+25 %) : {g['outside_sfm_points_box_plus_25pct']}, "
-              f"dont opacité > 0,5 : {g['outside_and_opaque_over_0_5']}", '',
-              'Aucun seuil de qualité : ces valeurs orientent l’inspection visuelle des planches.',
+              f"dont opacité > 0,5 : {g['outside_and_opaque_over_0_5']} (signalées, non retirées)", '',
               f"Limite : {summary['limitation']}", '']
-    (target / 'inspection.md').write_text('\n'.join(lines))
+    (root / 'inspection.md').write_text('\n'.join(lines))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Validation-only visual inspection of a gsplat checkpoint')
+    parser = argparse.ArgumentParser(description='Inspection of a gsplat checkpoint (validation + selected train faces)')
     parser.add_argument('--prep', required=True)
     parser.add_argument('--config', required=True, help='Training config of the inspected run')
+    parser.add_argument('--train-faces', type=int, default=3, help='Train faces per selection group')
     args = parser.parse_args(argv)
     try:
-        target = inspect(args.prep, read(args.config))
+        root = inspect(args.prep, read(args.config), args.train_faces)
     except Exception as error:
         print(f'ERROR: {error}', file=sys.stderr)
         return 1
-    print(target / 'inspection.md')
+    print(root / 'inspection.md')
     return 0
 
 

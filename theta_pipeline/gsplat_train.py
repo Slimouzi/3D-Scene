@@ -31,13 +31,18 @@ def config_sha256(cfg):
 
 # ---- data ---------------------------------------------------------------------
 
-def load_cameras(prep, group, device):
-    """Images and weights of one set, each hash-checked on read."""
+def load_cameras(prep, group, device, names=None):
+    """Images and weights of one set (optionally a subset of faces), each hash-checked on read."""
     import torch
     output = Path(prep).parent
     entries = read(Path(prep) / f'gsplat_inputs/cameras_{group}.json')['cameras']
     if any(c['set'] != group for c in entries):
         raise RuntimeError(f'cameras_{group}.json contains another set')
+    if names is not None:
+        missing = set(names) - {c['name'] for c in entries}
+        if missing:
+            raise RuntimeError(f'{sorted(missing)} not in cameras_{group}.json')
+        entries = [c for c in entries if c['name'] in set(names)]
     images, weights = [], []
     for c in entries:
         with Image.open(load_verified(output, c['image'])) as raw:
@@ -104,6 +109,29 @@ def render(params, viewmats, Ks, width, height, sh_degree):
         opacities=torch.sigmoid(params['opacities']), colors=colors, viewmats=viewmats, Ks=Ks,
         width=width, height=height, sh_degree=sh_degree, packed=False)
     return renders, info
+
+
+def densification_schedule(cfg):
+    """0-based iterations at which gsplat 1.5.3 DefaultStrategy acts, from its own conditions.
+
+    refine: grow + prune when start < i < stop, i % every == 0, i % reset_every >= pause.
+    large_pruning: the subset with i > reset_every. opacity_reset: gsplat tests
+    `i % reset_every == 0 & i > 0`, which operator precedence makes always false.
+    """
+    s = {'refine_start_iter': 500, 'refine_stop_iter': 15000, 'refine_every': 100, 'reset_every': 3000,
+         'pause_refine_after_reset': 0, **cfg['strategy']}
+    refine = [i for i in range(cfg['steps']) if s['refine_start_iter'] < i < s['refine_stop_iter']
+              and i % s['refine_every'] == 0 and i % s['reset_every'] >= s['pause_refine_after_reset']]
+    reset = [i for i in range(min(cfg['steps'], s['refine_stop_iter']))
+             if (i % s['reset_every'] == 0 & i > 0)]
+    return {'refine': refine, 'large_pruning': [i for i in refine if i > s['reset_every']],
+            'opacity_reset': reset}
+
+
+def schedule_summary(cfg):
+    def span(values):
+        return {'count': len(values), 'first': values[0] if values else None, 'last': values[-1] if values else None}
+    return {k: span(v) for k, v in densification_schedule(cfg).items()}
 
 
 # ---- losses and metrics ---------------------------------------------------------
@@ -356,6 +384,7 @@ def command_train(args):
               'points': manifest['points'], 'protocol': manifest['protocol'],
               'limitation': manifest['limitation'],
               'quality_thresholds': 'none: metrics are reported, not judged',
+              'densification_schedule': schedule_summary(cfg),
               'status': 'running', 'history': history}
     write(record, status)
     try:

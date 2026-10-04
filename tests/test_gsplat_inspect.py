@@ -55,5 +55,73 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(stats['outside_and_opaque_over_0_5'], 1)
 
 
+    def test_sizes_are_normalized_by_scene_scale(self):
+        scene_scale = 4.
+        scales = np.array([[.2] * 3, [.3, .1, .1], [1.] * 3])      # max axes .2, .3, 1.0
+        stats = gi.gaussian_statistics(np.zeros((3, 3)), scales, np.full(3, .9),
+                                       np.array([[-1, -1, -1], [1, 1, 1]], float), scene_scale, .1)
+        quantiles = stats['max_scale_over_scene_scale_quantiles']
+        self.assertAlmostEqual(quantiles['max'], 1. / scene_scale)
+        self.assertAlmostEqual(quantiles['p50'], .3 / scene_scale)
+        # Threshold .1 x 4 = .4: only the 1.0 Gaussian is large (0.3 would be large if unnormalized).
+        self.assertEqual(stats['larger_than_prune_scale3d'], 1)
+        np.testing.assert_array_equal(gi.large_gaussians(scales, scene_scale, .1), [False, False, True])
+        self.assertEqual(stats['scene_scale'], scene_scale)
+
+    def test_train_face_selection_by_glass_and_furniture(self):
+        from theta_pipeline.segmentation import LABELS
+        labels = np.zeros((64, 128), np.uint8)
+        labels[:, 60:68] = LABELS['glass']                   # straight ahead (front faces)
+        labels[:, :8] = labels[:, -8:] = LABELS['furniture']  # behind (seam)
+        rotations = {f'f{k}': r for k, r in enumerate(cube_rotations().values())}
+        cameras = [{'name': n, 'panorama_id': 'p'} for n in sorted(rotations)]
+        chosen, fractions = gi.select_train_faces(cameras, lambda pano: labels, rotations, 16, per_group=1)
+        front, back = 'f0', 'f2'                             # cube order: front, right, back, ...
+        self.assertEqual(chosen, [front, back])
+        self.assertGreater(fractions[front]['glass_windows'], 0)
+        self.assertGreater(fractions[back]['furniture'], 0)
+
+    def test_summary_excludes_empty_faces(self):
+        empty = {'pixels': 0, 'psnr': None, 'mean_abs_error': None}
+        regions = lambda v: {k: ({'pixels': 1, 'psnr': v, 'mean_abs_error': 0} if k == 'glass' else empty)
+                             for k in [*gi.REGIONS, 'contours', 'other']}
+        faces = [{'excluded': False, 'psnr': 20., 'ssim': .8, 'regions': regions(15.)},
+                 {'excluded': True, 'psnr': None, 'ssim': None, 'regions': regions(None)}]
+        summary = gi.summarize(faces)
+        self.assertEqual((summary['usable_faces'], summary['mean_psnr']), (1, 20.))
+        self.assertEqual(summary['mean_region_psnr']['glass'], 15.)
+        self.assertIsNone(summary['mean_region_psnr']['mirror'])
+
+
+class CameraCheckTests(unittest.TestCase):
+    def camera(self):
+        from theta_pipeline.geometry import homogeneous
+        rotation = cube_rotations()['right']
+        return {'K': [[8., 0, 8], [0, 8, 8], [0, 0, 1]],
+                'world_to_camera': homogeneous(rotation, np.array([.1, -.2, .3])).tolist(),
+                'width': 16, 'height': 16}
+
+    def test_exact_observations_have_zero_residual(self):
+        from theta_pipeline import gsplat_camera_check as cc
+        camera = self.camera()
+        rng = np.random.default_rng(0)
+        T = np.asarray(camera['world_to_camera'])
+        cam_points = np.column_stack((rng.uniform(-1, 1, (20, 2)), rng.uniform(2, 4, 20)))
+        world = (cam_points - T[:3, 3]) @ T[:3, :3]           # inverse rigid transform
+        points = {k: {'xyz': world[k].tolist()} for k in range(20)}
+        uv, depth = cc.project(camera['K'], camera['world_to_camera'], world)
+        self.assertTrue((depth > 0).all())
+        observations = [(k, tuple(uv[k])) for k in range(20)]
+        errors, behind = cc.residuals(camera, observations, points)
+        self.assertLess(errors.max(), 1e-9)
+        self.assertEqual(behind, 0)
+        shifted = [(k, (x + .5, y + .5)) for k, (x, y) in observations]
+        self.assertAlmostEqual(float(np.median(cc.residuals(camera, shifted, points)[0])), np.sqrt(.5), places=9)
+        points[0] = {'xyz': (-world[0] + 2 * (-T[:3, :3].T @ T[:3, 3])).tolist()}   # mirrored behind
+        self.assertEqual(cc.residuals(camera, observations, points)[1], 1)
+        self.assertEqual(cc.rigid(camera['world_to_camera'])[1], 1.0)
+        image = cc.overlay(np.zeros((16, 16, 3), np.uint8), observations[1:3], points, camera)
+        self.assertEqual(image.size, (16, 16))
+
 if __name__ == '__main__':
     unittest.main()
