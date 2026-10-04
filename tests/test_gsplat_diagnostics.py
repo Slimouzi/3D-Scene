@@ -158,9 +158,6 @@ class SheetTests(unittest.TestCase):
                 gs.load_columns(prep, ['leak:step_003000.pt'])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class CheckpointDiagnosisTests(unittest.TestCase):
     """Obstruction test geometry, non-finite accounting, report; no GPU needed."""
@@ -191,18 +188,67 @@ class CheckpointDiagnosisTests(unittest.TestCase):
         self.assertEqual(result['non_finite']['opacities'], {'nan': 0, 'inf': 1})
         self.assertEqual(result['count'], 1)                            # statistics over finite Gaussians only
 
-    def test_report_and_test_set_refusal(self):
+    def test_extent_rule_catches_large_far_centred_gaussians(self):
         from theta_pipeline import gsplat_checkpoint_diag as cd
-        face = lambda psnr: {'psnr': psnr, 'ssim': .7, 'low_alpha_fraction_of_valid': .01, 'near_gaussians': 3,
-                             'near_opaque_gaussians': 1, 'near_alpha_fraction_of_valid': .02}
+        T, K, size = self.camera()
+        reference = 2.
+        means = np.array([[0, 0, 3.], [0, 0, 3.], [0, 0, .5]])
+        scales = np.array([[.05] * 3, [.9] * 3, [.01] * 3])       # second: centre at 3, 3-sigma extent to 0.3
+        centre = cd.near_gaussians(T, K, size, means, reference)
+        extent = cd.near_extent_gaussians(T, K, size, means, scales, reference)
+        np.testing.assert_array_equal(centre, [False, False, True])
+        np.testing.assert_array_equal(extent, [False, True, True])
+        ranked = cd.largest_covering(T, K, size, means, scales, np.array([.9, .9, .9]), count=2)
+        self.assertEqual([g['index'] for g in ranked], [1, 2])
+        self.assertAlmostEqual(ranked[0]['nearest_extent_depth'], 3 - 2.7)
+        self.assertEqual(cd.face_number('pano_camera10/R0010011.png'), 10)
+
+    def test_luminance_and_shared_depth_scale(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        rgb = np.zeros((4, 4, 3))
+        rgb[:2] = 1.
+        valid = np.ones((4, 4), bool)
+        self.assertAlmostEqual(cd.luminance(rgb, valid), .5)
+        self.assertIsNone(cd.luminance(rgb, np.zeros((4, 4), bool)))
+        near, far = np.full((4, 4), 1.), np.full((4, 4), 3.)
+        alpha = np.ones((4, 4))
+        low, high = cd.depth_range([near, far], [alpha, alpha])
+        self.assertEqual((low, high), (1., 3.))
+        self.assertEqual(int(cd.depth_with_range(near, alpha, low, high)[0, 0]), 255)
+        self.assertEqual(int(cd.depth_with_range(far, alpha, low, high)[0, 0]), 0)
+
+    def test_sheet_and_report(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        reference = np.full((8, 8, 3), 120, np.uint8)
+        variant = lambda depth, psnr: {'label': 'v', 'rgb': np.full((8, 8, 3), .4), 'alpha': np.ones((8, 8)),
+                                       'depth': np.full((8, 8), depth), 'weight': np.ones((8, 8)), 'psnr': psnr}
+        image = cd.sheet('pano_camera1/R.png', reference, [variant(1., 18.), variant(2., None)], 'erreur 0-0,25')
+        self.assertEqual(image.size, (5 * 8 + 230, 2 * 8 + 44))
+        m = lambda psnr, removed=0: {'psnr': psnr, 'ssim': .7, 'render_luminance': .4, 'removed_gaussians': removed,
+                                     'removed_opaque': removed // 2}
         pop = {'count_total': 10, 'non_finite': {'means': {'nan': 0, 'inf': 0}}, 'opacity_quantiles': {},
                'max_scale_over_scene_scale_quantiles': {'p95': .01, 'max': .2},
                'outside_sfm_points_box_plus_25pct': 2, 'outside_and_opaque_over_0_5': 1}
-        result = {'training': 't', 'set': 'validation', 'panorama': 'R0010011', 'hypothesis': 'h', 'near_rule': 'r',
-                  'checkpoints': {'step_002000.pt': {'population': pop}, 'step_003000.pt': {'population': pop}},
-                  'faces': {'pano_camera0/R0010011.png': {'step_002000.pt': face(18.), 'step_003000.pt': face(16.5)}}}
+        a, b = 'step_002000.pt', 'step_003000.pt'
+        result = {'training': 't', 'set': 'validation', 'panorama': 'R0010011', 'hypothesis': 'h',
+                  'near_rules': {'centre': 'c', 'extent': 'e'},
+                  'checkpoints': {a: {'population': pop}, b: {'population': pop}},
+                  'faces': {'pano_camera1/R0010011.png': {
+                      f'{a}/complet': m(18.), f'{b}/complet': m(16.5), f'{b}/sans proches (centre)': m(16.6, 4),
+                      f'{b}/sans proches (étendue)': m(17.4, 12), 'reference_luminance': .5,
+                      f'{b}/largest_covering': [{'index': 7, 'depth': 3., 'extent_3sigma': 2.7,
+                                                 'projected_radius_px': 900., 'opacity': .9,
+                                                 'nearest_extent_depth': .3}]}}}
         text = cd.report(result)
-        self.assertIn('-1.50', text)
-        self.assertIn('aucune', text)
+        for expected in ('-1.50', '-0.100 / -0.100', '17.40 (+0.90)', '12 (6)', '| 7 | 3.000 | 2.700 | 900 |',
+                         'aucun élagage'):
+            self.assertIn(expected, text)
+
+    def test_test_set_refused(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
         with self.assertRaisesRegex(RuntimeError, 'test set'):
             cd.diagnose('unused', {}, ['a', 'b'], 'R0010008', group='test')
+
+
+if __name__ == '__main__':
+    unittest.main()
