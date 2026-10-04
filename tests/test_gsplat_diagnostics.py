@@ -73,12 +73,49 @@ class CheckpointTests(unittest.TestCase):
             b = self.save(Path(temp) / 'b', torch.zeros(4, 3))
             c = self.save(Path(temp) / 'c', torch.full((4, 3), 1e-6), generator_seed=1)
             same = gd.checkpoint_differences(a, b)
-            self.assertTrue(same['camera_generator_equal'] and same['params']['means']['identical'])
+            self.assertTrue(same['camera_generator_equal'])
+            self.assertEqual(same['params']['means']['status'], 'identical')
             different = gd.checkpoint_differences(a, c)
             self.assertFalse(different['camera_generator_equal'])
             self.assertAlmostEqual(different['params']['means']['max_abs_diff'], 1e-6, places=12)
             divergence = gd.first_divergence([], {'first_difference': {}}, [same, different])
             self.assertEqual(divergence['detail'], {'params': ['means'], 'state': ['camera_generator_equal']})
+
+    def test_shape_mismatch_is_non_comparable_never_infinite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            a = self.save(Path(temp) / 'a', torch.zeros(4, 3))
+            b = self.save(Path(temp) / 'b', torch.zeros(5, 3))
+            result = gd.checkpoint_differences(a, b)
+            means = result['params']['means']
+            self.assertFalse(means['comparable'])
+            self.assertEqual(means['status'], gd.NON_COMPARABLE)
+            self.assertIsNone(means['max_abs_diff'])
+            self.assertEqual((means['short']['shape'], means['long']['shape']), ([4, 3], [5, 3]))
+            text = gd.report({'short': 's', 'long': 'l', 'until': 3000, 'settings_differences': [],
+                              'trajectory': {'logged_steps_compared': 0, 'first_difference': {}},
+                              'checkpoints': [result], 'first_divergence': gd.first_divergence(
+                                  [], {'first_difference': {}}, [result])})
+            self.assertNotIn('inf', text)
+            self.assertIn(gd.NON_COMPARABLE, text)
+
+    def test_nan_and_inf_are_recorded(self):
+        a = torch.tensor([0., float('nan'), 1., float('inf')])
+        b = torch.tensor([0., 0., 1.5, float('inf')])
+        result = gd.compare_tensors(a, b)
+        self.assertEqual((result['short']['nan'], result['short']['inf']), (1, 1))
+        self.assertEqual(result['short']['dtype'], 'float32')
+        self.assertEqual(result['max_abs_diff'], .5)            # finite entries only
+        self.assertEqual(result['non_finite_entries'], 2)
+
+    def test_refused_operation_is_named(self):
+        def kernel():
+            raise RuntimeError('index_add_cuda_ does not have a deterministic implementation, but you set ...')
+        try:
+            kernel()
+        except RuntimeError as error:
+            refused = gd.refusal(error)
+        self.assertTrue(refused['message'].startswith('index_add_cuda_'))
+        self.assertTrue(any('kernel' in frame for frame in refused['frames']))
 
 
 class SheetTests(unittest.TestCase):

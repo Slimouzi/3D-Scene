@@ -133,12 +133,18 @@ class PairedSeedTests(unittest.TestCase):
                     maker.make(prep, name, 3000, [(3000, value)])
             experiment = {**self.paired, 'pairs': [p for p in self.paired['pairs'] if p['seed'] in (0, 1, 2)]}
             self.assertEqual(len(self.paired['pairs']), 6)
-            result = gsplat_compare.paired(experiment, prep)
+            result = gsplat_compare.paired(experiment, prep, {'psnr_db': .244, 'source': 'ctrl'})
             self.assertEqual([r['seed'] for r in result['pairs']], [0, 1, 2])
             psnr = result['summary']['psnr']
             self.assertEqual((psnr['n'], psnr['positive'], psnr['negative']), (3, 2, 1))
             self.assertAlmostEqual(psnr['mean'], (0.2 + 0.1 - 0.1) / 3)
-            self.assertIn('écart-type', gsplat_compare.paired_report(result))
+            self.assertAlmostEqual(psnr['median'], .1)
+            noise = result['summary']['psnr_vs_noise']
+            self.assertEqual((noise['seeds_beyond_noise'], noise['seeds']), (0, 3))
+            self.assertAlmostEqual(noise['abs_mean_over_noise'], (0.2 / 3) / .244)
+            text = gsplat_compare.paired_report(result)
+            self.assertIn('médiane', text)
+            self.assertIn('Bruit de réplication : 0.244', text)
 
 if __name__ == '__main__':
     unittest.main()

@@ -179,8 +179,11 @@ def report(result):
     return '\n'.join(lines)
 
 
-def paired(experiment, prep):
-    """Per-seed differences s1 - s0 at step 3000 on validation; mean, spread and signs."""
+def paired(experiment, prep, noise=None):
+    """Per-seed differences s1 - s0 at step 3000 on validation; mean, median, spread and signs.
+
+    `noise` is the replicate gap in PSNR (dB), e.g. {'psnr_db': 0.244, 'source': ...}.
+    """
     import statistics
     pairs = list(experiment['pairs'])
     if experiment.get('existing_seed0'):
@@ -197,6 +200,8 @@ def paired(experiment, prep):
             row['regions'] = {k: difference(ib['validation']['regions'], ia['validation']['regions'], k)
                               for k in REGIONS}
             row['large_gaussians'] = ib['gaussians']['larger_than_prune_scale3d'] - ia['gaussians']['larger_than_prune_scale3d']
+            row['outside'] = (ib['gaussians']['outside_sfm_points_box_plus_25pct']
+                              - ia['gaussians']['outside_sfm_points_box_plus_25pct'])
             row['outside_opaque'] = (ib['gaussians']['outside_and_opaque_over_0_5']
                                      - ia['gaussians']['outside_and_opaque_over_0_5'])
         rows.append(row)
@@ -205,13 +210,19 @@ def paired(experiment, prep):
         values = [v for v in values if v is not None]
         if not values:
             return None
-        return {'n': len(values), 'mean': statistics.fmean(values),
+        return {'n': len(values), 'mean': statistics.fmean(values), 'median': statistics.median(values),
                 'sd': statistics.stdev(values) if len(values) > 1 else None,
                 'positive': sum(v > 0 for v in values), 'negative': sum(v < 0 for v in values)}
     summary = {'psnr': describe(r['psnr'] for r in rows), 'ssim': describe(r['ssim'] for r in rows),
                'large_gaussians': describe(r.get('large_gaussians') for r in rows),
+               'outside': describe(r.get('outside') for r in rows),
                'outside_opaque': describe(r.get('outside_opaque') for r in rows),
                'regions': {k: describe((r.get('regions') or {}).get(k) for r in rows) for k in REGIONS}}
+    if noise and summary['psnr']:
+        gaps = [abs(r['psnr']) for r in rows if r['psnr'] is not None]
+        summary['psnr_vs_noise'] = {'noise_db': noise['psnr_db'], 'source': noise.get('source'),
+                                    'abs_mean_over_noise': abs(summary['psnr']['mean']) / noise['psnr_db'],
+                                    'seeds_beyond_noise': sum(g > noise['psnr_db'] for g in gaps), 'seeds': len(gaps)}
     return {'experiment': experiment['name'], 'prep_run': Path(prep).name, 'pairs': rows, 'summary': summary,
             'difference': 's1 - s0 at step 3000, validation only', 'quality_thresholds': 'none', 'created_at': now()}
 
@@ -219,22 +230,30 @@ def paired(experiment, prep):
 def paired_report(result):
     fmt = lambda v: '—' if v is None else (f'{v:+.3f}' if isinstance(v, float) else f'{v:+d}')
     lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés s1 − s0 à 3 000 (validation)", '',
-             '| Graine | ΔPSNR | ΔSSIM | ' + ' | '.join(f'Δ{k}' for k in REGIONS) + ' | Δgrandes | Δhors boîte opaques |',
-             '|---:|---:|---:|' + '---:|' * len(REGIONS) + '---:|---:|']
+             '| Graine | ΔPSNR | ΔSSIM | ' + ' | '.join(f'Δ{k}' for k in REGIONS)
+             + ' | Δgrandes | Δhors boîte | Δhors boîte opaques |',
+             '|---:|---:|---:|' + '---:|' * len(REGIONS) + '---:|---:|---:|']
     for r in result['pairs']:
         regions = r.get('regions') or {}
         lines.append(f"| {r['seed']} | {fmt(r['psnr'])} | {fmt(r['ssim'])} | "
                      + ' | '.join(fmt(regions.get(k)) for k in REGIONS)
-                     + f" | {fmt(r.get('large_gaussians'))} | {fmt(r.get('outside_opaque'))} |")
-    lines += ['', '| Quantité | n | moyenne | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|']
+                     + f" | {fmt(r.get('large_gaussians'))} | {fmt(r.get('outside'))} | {fmt(r.get('outside_opaque'))} |")
+    lines += ['', '| Quantité | n | moyenne | médiane | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|---:|']
     items = [('PSNR', result['summary']['psnr']), ('SSIM', result['summary']['ssim']),
              ('grandes gaussiennes', result['summary']['large_gaussians']),
+             ('hors boîte', result['summary']['outside']),
              ('hors boîte opaques', result['summary']['outside_opaque'])]
     items += [(f'région {k}', v) for k, v in result['summary']['regions'].items()]
     for label, d in items:
         if d:
             sd = '—' if d['sd'] is None else f"{d['sd']:.3f}"
-            lines.append(f"| {label} | {d['n']} | {d['mean']:+.3f} | {sd} | {d['positive']} | {d['negative']} |")
+            lines.append(f"| {label} | {d['n']} | {d['mean']:+.3f} | {d['median']:+.3f} | {sd} | "
+                         f"{d['positive']} | {d['negative']} |")
+    noise = result['summary'].get('psnr_vs_noise')
+    if noise:
+        lines += ['', f"Bruit de réplication : {noise['noise_db']:.3f} dB ({noise['source']}). "
+                      f"|moyenne ΔPSNR| / bruit = {noise['abs_mean_over_noise']:.2f} ; "
+                      f"graines où |ΔPSNR| dépasse le bruit : {noise['seeds_beyond_noise']}/{noise['seeds']}."]
     lines += ['', 'Lecture : un écart moyen petit devant son écart-type, ou de signe instable, ne départage pas '
                   'les bras. Aucun gagnant sur le PSNR moyen seul ; résultats limités au panorama de validation.', '']
     return '\n'.join(lines)
@@ -245,13 +264,18 @@ def main(argv=None):
     parser.add_argument('--experiment', required=True)
     parser.add_argument('--prep', required=True)
     parser.add_argument('--reference', help='<prep-run>:<training name> used as noise reference')
+    parser.add_argument('--noise-from', help='comparison.json of the controlled experiment (replicate gap)')
     args = parser.parse_args(argv)
     try:
         experiment = read(args.experiment)
         reference = tuple(args.reference.rsplit(':', 1)) if args.reference else None
         target = Path(args.prep) / 'comparisons' / experiment['name']
         if 'pairs' in experiment:
-            result = paired(experiment, Path(args.prep))
+            noise = None
+            if args.noise_from:
+                gap = read(args.noise_from)['noise']['replicate_minus_reference_psnr_3000']
+                noise = {'psnr_db': abs(gap), 'source': args.noise_from}
+            result = paired(experiment, Path(args.prep), noise)
             text = paired_report(result)
         else:
             result = compare(experiment, Path(args.prep), reference)
