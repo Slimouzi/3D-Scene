@@ -17,7 +17,7 @@
     "validation_fraction": 0.1,
     "neighbors_k": 4,
     "min_train_neighbors": 2,
-    "expected_partition_sha256": null,
+    "expected_partition_sha256": "3f77f8c543330327620d05d340653fd68d645081346e857df2ea559e064be14d",
     "base_split_run": "salon-split-005",
     "base_partition_sha256": "3949e717cb4d730c77ba302c3974224462e33425fd18e89a67afaea88291aaae",
     "fixed_test": [

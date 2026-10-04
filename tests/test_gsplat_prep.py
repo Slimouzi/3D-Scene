@@ -146,3 +146,79 @@ class PrepareTests(SplitFixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+PINNED_V2 = '3f77f8c543330327620d05d340653fd68d645081346e857df2ea559e064be14d'
+
+
+class PinnedV2ConfigTests(unittest.TestCase):
+    def test_gsplat_v2_points_to_the_extended_partition(self):
+        import json
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / 'configs'
+        config = json.loads((root / 'salon-gsplat-v2.json').read_text())
+        assert config['split_run'] == 'salon-split-006'
+        assert config['split']['expected_partition_sha256'] == PINNED_V2
+        split_v2 = json.loads((root / 'salon-split-v2.json').read_text())
+        self.assertEqual(split_v2['split']['expected_partition_sha256'], PINNED_V2)
+        self.assertEqual((split_v2['split']['base_split_run'], split_v2['split']['add_validation']),
+                         ('salon-split-005', 1))
+        # Historical configuration unchanged: still salon-split-005 and its partition.
+        historical = json.loads((root / 'salon-gsplat.json').read_text())
+        self.assertEqual(historical['split_run'], 'salon-split-005')
+        self.assertEqual(historical['split']['expected_partition_sha256'],
+                         '3949e717cb4d730c77ba302c3974224462e33425fd18e89a67afaea88291aaae')
+        self.assertEqual({k: v for k, v in config.items() if k not in ('split', 'split_run')},
+                         {k: v for k, v in historical.items() if k not in ('split', 'split_run')})
+
+
+class PinnedPartitionRefusalTests(SplitFixture):
+    """Preparation refuses a split whose partition hash differs from the pinned one."""
+
+    def test_copy_with_another_hash_is_refused_and_base_untouched(self):
+        import shutil
+        from theta_pipeline.storage import digest
+        runs = self.root / 'runs'
+        with Run(self.config, 'salon-split-005').locked() as run:
+            self.run_split(run)
+        base = read(runs / 'salon-split-005/split.json')
+        base_digest = digest(runs / 'salon-split-005/split.json')
+        snapshot = lambda: {str(p.relative_to(runs / 'salon-split-005')): digest(p)
+                            for p in sorted((runs / 'salon-split-005').rglob('*')) if p.is_file()}
+        before = snapshot()
+        write(self.root / 'v2.json', {**self.base, 'semantic_run': 'sem', 'sfm_run': 'sfm', 'split': {
+            'base_split_run': 'salon-split-005', 'base_partition_sha256': base['partition_sha256'],
+            'fixed_test': base['test'], 'add_validation': 1}})
+        with Run(self.root / 'v2.json', 'salon-split-006').locked() as run:
+            self.run_split(run)
+        expected = read(runs / 'salon-split-006/split.json')['partition_sha256']
+        # Copy of salon-split-006 whose split.json carries another hash (file integrity kept consistent).
+        copy = runs / 'salon-split-006-copy'
+        shutil.copytree(runs / 'salon-split-006', copy, ignore=shutil.ignore_patterns('.lock'))
+        record = read(copy / 'split.json')
+        found = 'f' * 64
+        write(copy / 'split.json', {**record, 'partition_sha256': found})
+        state = read(copy / 'run.json')
+        state['stages']['auto_split']['artifacts']['split.json'] = digest(copy / 'split.json')
+        write(copy / 'run.json', state)
+        write(self.root / 'gs-v2.json', {**self.base, 'semantic_run': 'sem', 'sfm_run': 'sfm',
+                                         'split_run': 'salon-split-006-copy',
+                                         'split': {'expected_partition_sha256': expected}})
+        with Run(self.root / 'gs-v2.json', 'gsplat-refused').locked() as run:
+            run.stage('audit', stages.audit)
+            with self.assertRaises(RuntimeError) as caught:
+                run.stage('import_split', gsplat_prep.import_split, requires=('audit',))
+        message = str(caught.exception)
+        self.assertIn(expected, message)
+        self.assertIn(found, message)
+        self.assertEqual(digest(runs / 'salon-split-005/split.json'), base_digest)
+        self.assertEqual(snapshot(), before)
+        # The genuine salon-split-006 with the same pinned hash is accepted.
+        write(self.root / 'gs-ok.json', {**self.base, 'semantic_run': 'sem', 'sfm_run': 'sfm',
+                                         'split_run': 'salon-split-006',
+                                         'split': {'expected_partition_sha256': expected}})
+        with Run(self.root / 'gs-ok.json', 'gsplat-accepted').locked() as run:
+            run.stage('audit', stages.audit)
+            run.stage('import_split', gsplat_prep.import_split, requires=('audit',))
+            self.assertEqual(read(run.path / 'split_import/split.json')['partition_sha256'], expected)
+        self.assertEqual(snapshot(), before)
