@@ -1,0 +1,78 @@
+{
+  "name": "paired-seeds-3k",
+  "status": "defined, not run",
+  "question": "Over several seeds, does training-time large-Gaussian pruning (s1) change novel-view quality on the validation panorama relative to s0, and how many extreme Gaussians does it remove?",
+  "gate": "run only if divergence.md shows identical settings, schedules, camera order and RNG states up to 3000 for both short/long pairs, and the determinism probe explains any remaining gap",
+  "design": "paired: for each seed, s0 and s1 share everything except reset_every (large-pruning window i = 1100..2400); 6 seeds x 2 arms, 3000 steps each",
+  "seed_effect": "the seed sets the camera draw order (torch.Generator) and torch.manual_seed; initialization is deterministic",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "arms": [
+    "configs/gsplat-pair-3k-s0-seed0.json",
+    "configs/gsplat-pair-3k-s1-seed0.json",
+    "configs/gsplat-pair-3k-s0-seed1.json",
+    "configs/gsplat-pair-3k-s1-seed1.json",
+    "configs/gsplat-pair-3k-s0-seed2.json",
+    "configs/gsplat-pair-3k-s1-seed2.json",
+    "configs/gsplat-pair-3k-s0-seed3.json",
+    "configs/gsplat-pair-3k-s1-seed3.json",
+    "configs/gsplat-pair-3k-s0-seed4.json",
+    "configs/gsplat-pair-3k-s1-seed4.json",
+    "configs/gsplat-pair-3k-s0-seed5.json",
+    "configs/gsplat-pair-3k-s1-seed5.json"
+  ],
+  "pairs": [
+    {
+      "seed": 0,
+      "s0": "pair-3k-s0-seed0",
+      "s1": "pair-3k-s1-seed0"
+    },
+    {
+      "seed": 1,
+      "s0": "pair-3k-s0-seed1",
+      "s1": "pair-3k-s1-seed1"
+    },
+    {
+      "seed": 2,
+      "s0": "pair-3k-s0-seed2",
+      "s1": "pair-3k-s1-seed2"
+    },
+    {
+      "seed": 3,
+      "s0": "pair-3k-s0-seed3",
+      "s1": "pair-3k-s1-seed3"
+    },
+    {
+      "seed": 4,
+      "s0": "pair-3k-s0-seed4",
+      "s1": "pair-3k-s1-seed4"
+    },
+    {
+      "seed": 5,
+      "s0": "pair-3k-s0-seed5",
+      "s1": "pair-3k-s1-seed5"
+    }
+  ],
+  "prep_run": "salon-gsplat-008: new preparation at the commit used for these trainings (the trainer requires the preparing code); same verified inputs and partition",
+  "metrics": {
+    "primary": "per-seed paired difference s1 - s0 of mean validation PSNR and SSIM at 3000",
+    "secondary": [
+      "paired differences of validation region PSNR (glass, contours, furniture, mirror)",
+      "large Gaussians and out-of-box opaque Gaussians, s1 - s0",
+      "comparative sheet of the same validation faces for every seed"
+    ]
+  },
+  "reading": "report mean, standard deviation and sign count of the paired differences; no winner on mean PSNR alone; results limited to validation panorama R0010006",
+  "not_used": [
+    "test set (reserved; evaluate-test --final not run)",
+    "longer trainings"
+  ],
+  "quality_thresholds": "none",
+  "relation_to_ctrl": "ctrl-3k-s0/s1 on salon-gsplat-007 are not reused: all pairs share one preparation and one commit"
+}

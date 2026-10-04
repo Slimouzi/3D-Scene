@@ -107,5 +107,38 @@ class CompareTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'test set'):
                 gsplat_compare.compare(EXPERIMENT, prep)
 
+
+class PairedSeedTests(unittest.TestCase):
+    paired = json.loads((ROOT / 'configs/experiments/paired-seeds-3k.json').read_text())
+
+    def test_pairs_differ_only_by_pruning(self):
+        for pair in self.paired['pairs']:
+            a, b = (json.loads((ROOT / f"configs/gsplat-{pair[k]}.json").read_text()) for k in ('s0', 's1'))
+            self.assertEqual(a['seed'], pair['seed'])
+            self.assertEqual(b['seed'], pair['seed'])
+            strip = lambda c: {k: v for k, v in c.items() if k not in ('name', 'strategy', 'schedule')}
+            self.assertEqual(strip(a), strip(b))
+            self.assertEqual(a['strategy'], ARMS['ctrl-3k-s0']['strategy'])
+            self.assertEqual(b['strategy'], ARMS['ctrl-3k-s1']['strategy'])
+            self.assertEqual(densification_schedule(b)['large_pruning'], list(range(1100, 2500, 100)))
+            self.assertEqual(densification_schedule(a)['large_pruning'], [])
+
+    def test_paired_statistics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prep = Path(temp)
+            maker = CompareTests()
+            for seed, (p0, p1) in {0: (18.0, 18.2), 1: (17.9, 18.0), 2: (18.1, 18.0)}.items():
+                names = (f'pair-3k-s0-seed{seed}', f'pair-3k-s1-seed{seed}')
+                for name, value in zip(names, (p0, p1)):
+                    maker.make(prep, name, 3000, [(3000, value)])
+            experiment = {**self.paired, 'pairs': [p for p in self.paired['pairs'] if p['seed'] in (0, 1, 2)]}
+            self.assertEqual(len(self.paired['pairs']), 6)
+            result = gsplat_compare.paired(experiment, prep)
+            self.assertEqual([r['seed'] for r in result['pairs']], [0, 1, 2])
+            psnr = result['summary']['psnr']
+            self.assertEqual((psnr['n'], psnr['positive'], psnr['negative']), (3, 2, 1))
+            self.assertAlmostEqual(psnr['mean'], (0.2 + 0.1 - 0.1) / 3)
+            self.assertIn('écart-type', gsplat_compare.paired_report(result))
+
 if __name__ == '__main__':
     unittest.main()

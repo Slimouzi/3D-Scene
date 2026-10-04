@@ -1,0 +1,42 @@
+{
+  "name": "pair-3k-s0-seed2",
+  "steps": 3000,
+  "seed": 2,
+  "ssim_lambda": 0.2,
+  "init_opacity": 0.1,
+  "init_scale": 1.0,
+  "lr": {
+    "means": 0.00016,
+    "scales": 0.005,
+    "quats": 0.001,
+    "opacities": 0.05,
+    "sh0": 0.0025,
+    "shN": 0.000125
+  },
+  "means_lr_final_ratio": 0.01,
+  "sh_degree": 2,
+  "sh_degree_interval": 1000,
+  "means_lr_decay_steps": 3000,
+  "log_every": 100,
+  "validate_every": 1000,
+  "checkpoint_every": 1000,
+  "strategy": {
+    "refine_start_iter": 500,
+    "refine_stop_iter": 2500,
+    "refine_every": 100,
+    "reset_every": 3000
+  },
+  "schedule": {
+    "factors": {
+      "duration": 3000,
+      "pruning": "s0",
+      "seed": 2
+    },
+    "pruning": "no large-Gaussian pruning (as the reference l4-short-001)",
+    "densification": "grow/prune opacity < 0.005 at i = 600, 700, ..., 2400 in every arm",
+    "means_lr": "exponential decay to 0.01 x initial over 3000 steps, then constant",
+    "sh_degree": "0 / 1 / 2 from i = 0 / 1000 / 2000, capped at 2 in every arm",
+    "opacity_reset": "none (never triggered in gsplat 1.5.3)",
+    "after_2500": "no densification or pruning; optimization only"
+  }
+}

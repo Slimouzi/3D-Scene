@@ -1,0 +1,218 @@
+"""Where do two paired gsplat trainings first diverge? (read-only; checkpoints need torch)
+
+    python -m theta_pipeline.gsplat_divergence --prep Output/runs/salon-gsplat-007 \
+        --short configs/gsplat-ctrl-3k-s0.json --long configs/gsplat-ctrl-10k-s0.json --until 3000
+
+Compares, up to `until`, what each run actually used: effective settings (learning rates,
+position decay, SH schedule, densification/pruning schedule, cadence, seed), the logged
+trajectory (camera drawn, position learning rate, SH degree, Gaussian count, loss) and
+each common checkpoint (camera generator and RNG states, scheduler, optimizer steps,
+strategy accumulators, parameters). The earliest difference is reported with its kind;
+nothing is attributed to GPU non-determinism without a determinism probe
+(`--probe-steps`), which replays the same start twice in a separate diagnostics folder.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+from .gsplat_train import densification_schedule, means_lr_factor
+from .storage import now, read, write
+
+IGNORED = {'name', 'steps', 'schedule'}          # documentation and run length, not dynamics up to `until`
+
+
+def effective_settings(cfg, until):
+    """Settings that act on iterations i < until, as the trainer applies them."""
+    schedule = densification_schedule({**cfg, 'steps': until})
+    factor = means_lr_factor(cfg)
+    return {'config': {k: v for k, v in cfg.items() if k not in IGNORED},
+            'refine': schedule['refine'], 'large_pruning': schedule['large_pruning'],
+            'opacity_reset': schedule['opacity_reset'],
+            'means_lr_factor': [factor(i) for i in range(until + 1)],
+            'sh_degree': [min(i // cfg['sh_degree_interval'], cfg['sh_degree']) for i in range(until)],
+            'validated_steps': [s for s in range(1, until + 1)
+                                if s % cfg['validate_every'] == 0 or s == cfg['steps']],
+            'checkpoint_steps': [s for s in range(1, until + 1)
+                                 if s % cfg['checkpoint_every'] == 0 or s == cfg['steps']]}
+
+
+def settings_differences(a, b):
+    out = []
+    for key in sorted(set(a['config']) | set(b['config'])):
+        if a['config'].get(key) != b['config'].get(key):
+            out.append({'kind': 'setting', 'what': key, 'short': a['config'].get(key), 'long': b['config'].get(key)})
+    for key in ('refine', 'large_pruning', 'opacity_reset', 'sh_degree', 'validated_steps', 'checkpoint_steps'):
+        if a[key] != b[key]:
+            first = next((i for i, (x, y) in enumerate(zip(a[key], b[key])) if x != y), min(len(a[key]), len(b[key])))
+            out.append({'kind': 'schedule', 'what': key, 'first_index': first})
+    lr = next((i for i, (x, y) in enumerate(zip(a['means_lr_factor'], b['means_lr_factor'])) if x != y), None)
+    if lr is not None:
+        out.append({'kind': 'schedule', 'what': 'means_lr_factor', 'iteration': lr})
+    return out
+
+
+def jsonl(path):
+    return [json.loads(line) for line in Path(path).read_text().splitlines()] if Path(path).exists() else []
+
+
+def trajectory_differences(short, long, until):
+    """First logged step where each quantity differs (exact comparison)."""
+    a = {r['step']: r for r in short if r['step'] <= until}
+    b = {r['step']: r for r in long if r['step'] <= until}
+    common = sorted(set(a) & set(b))
+    first = {}
+    for key in ('camera', 'sh_degree', 'lr_means', 'gaussians', 'loss', 'l1', 'ssim'):
+        step = next((s for s in common if a[s].get(key) != b[s].get(key)), None)
+        if step is not None:
+            first[key] = {'step': step, 'short': a[step].get(key), 'long': b[step].get(key)}
+    missing = sorted(set(a) ^ set(b))
+    return {'logged_steps_compared': len(common), 'first_difference': first, 'steps_logged_by_one_only': missing}
+
+
+def checkpoint_differences(path_a, path_b):
+    """Exact comparison of two checkpoints saved at the same step."""
+    import torch
+    a = torch.load(path_a, map_location='cpu', weights_only=False)
+    b = torch.load(path_b, map_location='cpu', weights_only=False)
+    same = lambda x, y: torch.equal(x, y) if torch.is_tensor(x) and torch.is_tensor(y) else x == y
+    out = {'step': a['step'], 'sh_degree_equal': a['sh_degree'] == b['sh_degree'],
+           'camera_generator_equal': torch.equal(a['rng']['generator'], b['rng']['generator']),
+           'torch_rng_equal': torch.equal(a['rng']['torch'], b['rng']['torch']),
+           'cuda_rng_equal': len(a['rng']['cuda']) == len(b['rng']['cuda'])
+           and all(torch.equal(x, y) for x, y in zip(a['rng']['cuda'], b['rng']['cuda'])),
+           'scheduler_equal': {k: a['scheduler'][k] == b['scheduler'].get(k)
+                               for k in ('last_epoch', 'base_lrs', '_last_lr') if k in a['scheduler']},
+           'optimizer_steps': {}, 'params': {}, 'strategy_state': {}}
+    for name, opt in a['optimizers'].items():
+        steps = lambda o: sorted(float(s['step']) for s in o['state'].values() if 'step' in s)
+        out['optimizer_steps'][name] = {'short': steps(opt)[:1], 'long': steps(b['optimizers'][name])[:1]}
+    for name, tensor in a['params'].items():
+        other = b['params'][name]
+        if tensor.shape != other.shape:
+            out['params'][name] = {'shape_short': list(tensor.shape), 'shape_long': list(other.shape)}
+        else:
+            out['params'][name] = {'shape': list(tensor.shape), 'identical': bool(torch.equal(tensor, other)),
+                                   'max_abs_diff': float((tensor - other).abs().max()) if tensor.numel() else 0.}
+    for key, value in a['strategy_state'].items():
+        out['strategy_state'][key] = bool(same(value, b['strategy_state'].get(key)))
+    return out
+
+
+def first_divergence(settings, trajectory, checkpoints):
+    """Earliest difference, ordered by the iteration at which it acts."""
+    if settings:
+        return {'at': 'before iteration 0 (settings or schedule)', 'differences': settings}
+    events = [(v['step'], f'logged {k}', v) for k, v in trajectory['first_difference'].items()]
+    for c in checkpoints:
+        diffs = [k for k, v in c['params'].items() if not v.get('identical', False)]
+        flags = [k for k in ('sh_degree_equal', 'camera_generator_equal', 'torch_rng_equal', 'cuda_rng_equal')
+                 if not c[k]]
+        if diffs or flags:
+            events.append((c['step'], 'checkpoint', {'params': diffs, 'state': flags}))
+    if not events:
+        return {'at': None, 'note': 'no difference found in settings, logs or checkpoints'}
+    step, kind, detail = min(events, key=lambda e: (e[0], e[1]))
+    return {'at': step, 'kind': kind, 'detail': detail,
+            'same_inputs_until_then': not settings,
+            'interpretation': 'settings, schedules, camera order and RNG states are identical up to here: '
+                              'compare with the determinism probe before attributing the gap to the GPU'}
+
+
+def compare(prep, short_cfg, long_cfg, until):
+    prep = Path(prep)
+    a_dir, b_dir = (prep / 'training' / c['name'] for c in (short_cfg, long_cfg))
+    settings = settings_differences(effective_settings(short_cfg, until), effective_settings(long_cfg, until))
+    trajectory = trajectory_differences(jsonl(a_dir / 'train.jsonl'), jsonl(b_dir / 'train.jsonl'), until)
+    checkpoints = []
+    for step in range(short_cfg['checkpoint_every'], until + 1, short_cfg['checkpoint_every']):
+        name = f'step_{step:06d}.pt'
+        if (a_dir / 'checkpoints' / name).exists() and (b_dir / 'checkpoints' / name).exists():
+            checkpoints.append(checkpoint_differences(a_dir / 'checkpoints' / name, b_dir / 'checkpoints' / name))
+    return {'short': short_cfg['name'], 'long': long_cfg['name'], 'until': until,
+            'settings_differences': settings, 'trajectory': trajectory, 'checkpoints': checkpoints,
+            'first_divergence': first_divergence(settings, trajectory, checkpoints), 'created_at': now()}
+
+
+def probe(prep, cfg, steps):
+    """Replay the first `steps` iterations twice with identical inputs; report the first loss gap."""
+    import tempfile
+    from .gsplat_preflight import qualify, verify_prep
+    from . import gsplat_train
+    prep = Path(prep).resolve()
+    problems = verify_prep(prep) + qualify()['problems']
+    if problems:
+        raise RuntimeError('; '.join(problems))
+    data = gsplat_train.load_cameras(prep, 'train', 'cuda')
+    points = gsplat_train.load_points(prep)
+    probe_cfg = {**cfg, 'name': f"{cfg['name']}-probe", 'steps': steps, 'log_every': 1,
+                 'validate_every': 10 ** 9, 'checkpoint_every': 10 ** 9}
+    meta = {'config_sha256': 'probe', 'manifest_sha256': 'probe', 'partition_sha256': 'probe', 'git_commit': 'probe'}
+    logs = []
+    (prep / 'diagnostics').mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=prep / 'diagnostics') as temp:
+        for run in ('a', 'b'):
+            gsplat_train.train(data, None, points, probe_cfg, Path(temp) / run, meta)
+            logs.append(jsonl(Path(temp) / run / 'train.jsonl'))
+    gaps = trajectory_differences(*logs, steps)
+    result = {'config': cfg['name'], 'steps': steps, 'same_inputs_and_seed': True,
+              'first_difference': gaps['first_difference'], 'created_at': now(),
+              'reading': 'a difference here, with identical inputs, seed and code, is run-to-run GPU '
+                         'non-determinism; none means the trainer is reproducible over these steps'}
+    write(prep / 'diagnostics' / f"determinism-{cfg['name']}-{steps}.json", result)
+    return result
+
+
+def report(result):
+    lines = [f"# Divergence {result['short']} / {result['long']} jusqu’à {result['until']}", '']
+    lines.append('Paramètres effectifs : ' + ('identiques' if not result['settings_differences'] else
+                                              json.dumps(result['settings_differences'], ensure_ascii=False)))
+    t = result['trajectory']
+    lines += [f"Trajectoires journalisées : {t['logged_steps_compared']} étapes comparées.", '']
+    for key, value in t['first_difference'].items():
+        lines.append(f"- {key} : première différence à l’étape {value['step']} "
+                     f"({value['short']} contre {value['long']})")
+    if not t['first_difference']:
+        lines.append('- aucune différence dans les journaux')
+    lines += ['', '| Checkpoint | Générateur caméras | RNG torch | RNG CUDA | SH | Paramètres identiques | Écart max |',
+              '|---|---|---|---|---|---|---:|']
+    for c in result['checkpoints']:
+        identical = [k for k, v in c['params'].items() if v.get('identical')]
+        gap = max((v.get('max_abs_diff', float('inf')) for v in c['params'].values()), default=0.)
+        lines.append(f"| {c['step']} | {c['camera_generator_equal']} | {c['torch_rng_equal']} | {c['cuda_rng_equal']} | "
+                     f"{c['sh_degree_equal']} | {len(identical)}/{len(c['params'])} | {gap:.3g} |")
+    d = result['first_divergence']
+    lines += ['', f"Première divergence : {d.get('at')} — {d.get('kind', '')} {json.dumps(d.get('detail', ''), ensure_ascii=False)}",
+              d.get('interpretation', d.get('note', '')), '']
+    return '\n'.join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='First divergence between paired gsplat trainings')
+    parser.add_argument('--prep', required=True)
+    parser.add_argument('--short', required=True)
+    parser.add_argument('--long', required=True)
+    parser.add_argument('--until', type=int, default=3000)
+    parser.add_argument('--probe-steps', type=int, help='Also replay the short arm twice for this many steps (GPU)')
+    args = parser.parse_args(argv)
+    try:
+        short_cfg, long_cfg = read(args.short), read(args.long)
+        result = compare(args.prep, short_cfg, long_cfg, args.until)
+        if args.probe_steps:
+            result['determinism_probe'] = probe(args.prep, short_cfg, args.probe_steps)
+        target = Path(args.prep) / 'diagnostics' / f"divergence-{short_cfg['name']}-{long_cfg['name']}"
+        write(target / 'divergence.json', result)
+        text = report(result)
+        if args.probe_steps:
+            first = result['determinism_probe']['first_difference']
+            text += ('\nSonde de déterminisme (même entrée, même graine, deux fois) : '
+                     + (json.dumps(first, ensure_ascii=False) if first else 'aucune différence') + '\n')
+        (target / 'divergence.md').write_text(text)
+    except Exception as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        return 1
+    print(target / 'divergence.md')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

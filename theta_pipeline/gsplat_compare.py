@@ -179,6 +179,67 @@ def report(result):
     return '\n'.join(lines)
 
 
+def paired(experiment, prep):
+    """Per-seed differences s1 - s0 at step 3000 on validation; mean, spread and signs."""
+    import statistics
+    pairs = list(experiment['pairs'])
+    if experiment.get('existing_seed0'):
+        pairs.append({'seed': 0, 's0': 'ctrl-3k-s0', 's1': 'ctrl-3k-s1'})
+    rows = []
+    for pair in sorted(pairs, key=lambda p: p['seed']):
+        a, b = arm_summary(prep, pair['s0']), arm_summary(prep, pair['s1'])
+        if a.get('test_used') or b.get('test_used'):
+            raise RuntimeError('an arm used the test set: the comparison is not valid')
+        row = {'seed': pair['seed'], 'status': (a['status'], b['status']),
+               'psnr': difference(b, a, 'val_psnr_3000'), 'ssim': difference(b, a, 'val_ssim_3000')}
+        ia, ib = a.get('inspection_3000'), b.get('inspection_3000')
+        if ia and ib:
+            row['regions'] = {k: difference(ib['validation']['regions'], ia['validation']['regions'], k)
+                              for k in REGIONS}
+            row['large_gaussians'] = ib['gaussians']['larger_than_prune_scale3d'] - ia['gaussians']['larger_than_prune_scale3d']
+            row['outside_opaque'] = (ib['gaussians']['outside_and_opaque_over_0_5']
+                                     - ia['gaussians']['outside_and_opaque_over_0_5'])
+        rows.append(row)
+
+    def describe(values):
+        values = [v for v in values if v is not None]
+        if not values:
+            return None
+        return {'n': len(values), 'mean': statistics.fmean(values),
+                'sd': statistics.stdev(values) if len(values) > 1 else None,
+                'positive': sum(v > 0 for v in values), 'negative': sum(v < 0 for v in values)}
+    summary = {'psnr': describe(r['psnr'] for r in rows), 'ssim': describe(r['ssim'] for r in rows),
+               'large_gaussians': describe(r.get('large_gaussians') for r in rows),
+               'outside_opaque': describe(r.get('outside_opaque') for r in rows),
+               'regions': {k: describe((r.get('regions') or {}).get(k) for r in rows) for k in REGIONS}}
+    return {'experiment': experiment['name'], 'prep_run': Path(prep).name, 'pairs': rows, 'summary': summary,
+            'difference': 's1 - s0 at step 3000, validation only', 'quality_thresholds': 'none', 'created_at': now()}
+
+
+def paired_report(result):
+    fmt = lambda v: '—' if v is None else (f'{v:+.3f}' if isinstance(v, float) else f'{v:+d}')
+    lines = [f"# {result['experiment']} — {result['prep_run']} : écarts appariés s1 − s0 à 3 000 (validation)", '',
+             '| Graine | ΔPSNR | ΔSSIM | ' + ' | '.join(f'Δ{k}' for k in REGIONS) + ' | Δgrandes | Δhors boîte opaques |',
+             '|---:|---:|---:|' + '---:|' * len(REGIONS) + '---:|---:|']
+    for r in result['pairs']:
+        regions = r.get('regions') or {}
+        lines.append(f"| {r['seed']} | {fmt(r['psnr'])} | {fmt(r['ssim'])} | "
+                     + ' | '.join(fmt(regions.get(k)) for k in REGIONS)
+                     + f" | {fmt(r.get('large_gaussians'))} | {fmt(r.get('outside_opaque'))} |")
+    lines += ['', '| Quantité | n | moyenne | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|']
+    items = [('PSNR', result['summary']['psnr']), ('SSIM', result['summary']['ssim']),
+             ('grandes gaussiennes', result['summary']['large_gaussians']),
+             ('hors boîte opaques', result['summary']['outside_opaque'])]
+    items += [(f'région {k}', v) for k, v in result['summary']['regions'].items()]
+    for label, d in items:
+        if d:
+            sd = '—' if d['sd'] is None else f"{d['sd']:.3f}"
+            lines.append(f"| {label} | {d['n']} | {d['mean']:+.3f} | {sd} | {d['positive']} | {d['negative']} |")
+    lines += ['', 'Lecture : un écart moyen petit devant son écart-type, ou de signe instable, ne départage pas '
+                  'les bras. Aucun gagnant sur le PSNR moyen seul ; résultats limités au panorama de validation.', '']
+    return '\n'.join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Validation-only comparison of controlled gsplat arms')
     parser.add_argument('--experiment', required=True)
@@ -188,10 +249,15 @@ def main(argv=None):
     try:
         experiment = read(args.experiment)
         reference = tuple(args.reference.rsplit(':', 1)) if args.reference else None
-        result = compare(experiment, Path(args.prep), reference)
         target = Path(args.prep) / 'comparisons' / experiment['name']
+        if 'pairs' in experiment:
+            result = paired(experiment, Path(args.prep))
+            text = paired_report(result)
+        else:
+            result = compare(experiment, Path(args.prep), reference)
+            text = report(result)
         write(target / 'comparison.json', result)
-        (target / 'comparison.md').write_text(report(result))
+        (target / 'comparison.md').write_text(text)
     except Exception as error:
         print(f'ERROR: {error}', file=sys.stderr)
         return 1

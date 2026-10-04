@@ -283,6 +283,7 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
     import torch
     from gsplat.strategy import DefaultStrategy
     out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     scale = scene_scale(train_data['viewmats'])
     meta = {**meta, 'scene_scale': scale}
     strategy = DefaultStrategy(verbose=False, **cfg['strategy'])
