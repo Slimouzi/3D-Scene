@@ -75,6 +75,24 @@ def region_metrics(reference, rendered, weight, regions):
     return rows
 
 
+def detail_ratio(reference, rendered, mask):
+    """Mean luminance-gradient magnitude of the render over that of the reference, inside `mask`.
+
+    Below 1: the render is smoother than the reference there (lost detail); None if the
+    region is absent or the reference is flat.
+    """
+    def gradient(image):
+        y = np.asarray(image, float) @ np.array([.2126, .7152, .0722])
+        gx, gy = np.zeros_like(y), np.zeros_like(y)
+        gx[:, 1:-1] = y[:, 2:] - y[:, :-2]
+        gy[1:-1] = y[2:] - y[:-2]
+        return np.hypot(gx, gy)
+    if not mask.any():
+        return None
+    ref = gradient(reference)[mask].mean()
+    return float(gradient(rendered)[mask].mean() / ref) if ref > 0 else None
+
+
 def error_image(reference, rendered, weight):
     """Absolute error, mean over channels, black-to-yellow; excluded pixels in blue."""
     error = np.abs(rendered.astype(float) - reference.astype(float)).mean(-1) / 255
@@ -179,8 +197,11 @@ def render_face(params, data, i, degree):
     return renders[0, ..., :3].clamp(0, 1), alphas[0, ..., 0], renders[0, ..., 3]
 
 
-def export_faces(target, cameras, data, params, degree, sources):
+def export_faces(target, cameras, data, params, degree, sources, write_panels=True):
+    """Per-face metrics (PSNR, SSIM, luminance, per-region PSNR/SSIM/detail) and, optionally, panels."""
+    import torch
     from . import gsplat_train
+    from .gsplat_checkpoint_diag import luminance
     faces = []
     for i, camera in enumerate(cameras):
         rgb, alpha, depth = render_face(params, data, i, degree)
@@ -197,6 +218,21 @@ def export_faces(target, cameras, data, params, degree, sources):
         regions = {name: np.isin(labels, codes) for name, codes in REGIONS.items()}
         regions['contours'] = contour_mask(reference, valid)
         regions['other'] = valid & ~np.logical_or.reduce(list(regions.values()))
+        target_tensor = data['images'][i:i + 1].float() / 255
+        with torch.no_grad():
+            ssim_map = gsplat_train.ssim_map(rgb[None], target_tensor, data['weights'][i:i + 1] > 0)[0].cpu().numpy()
+        region_rows = region_metrics(reference, rendered_float, weight, regions)
+        for name, mask in regions.items():
+            inside = mask & valid
+            region_rows[name]['ssim'] = float(ssim_map[inside].mean()) if inside.any() else None
+            region_rows[name]['detail_ratio'] = detail_ratio(reference, rendered_float, inside)
+        lum = {'reference_luminance': luminance(reference / 255, valid),
+               'render_luminance': luminance(rendered_float / 255, valid)}
+        if not write_panels:
+            faces.append({'camera': camera['name'], 'panorama_id': camera['panorama_id'], **metrics, **lum,
+                          'low_alpha_fraction_of_valid': float(((alpha < .5) & valid).sum() / max(valid.sum(), 1)),
+                          'regions': region_rows, 'files': {}, 'contact_sheet': None})
+            continue
         stem = camera['name'].replace('/', '__').removesuffix('.png')
         panels = [('reference', reference), ('render', rendered), ('weights', (weight * 255).astype(np.uint8)),
                   ('error', error_image(reference, rendered_float, weight)), ('alpha', (alpha * 255).astype(np.uint8)),
@@ -210,10 +246,9 @@ def export_faces(target, cameras, data, params, degree, sources):
         sheet = target / f'{stem}.jpg'
         contact_sheet(camera['name'], panels, {k: None if metrics[k] is None else round(metrics[k], 3)
                                                for k in ('psnr', 'ssim')}).save(sheet, quality=90)
-        faces.append({'camera': camera['name'], 'panorama_id': camera['panorama_id'], **metrics,
+        faces.append({'camera': camera['name'], 'panorama_id': camera['panorama_id'], **metrics, **lum,
                       'low_alpha_fraction_of_valid': float(((alpha < .5) & valid).sum() / max(valid.sum(), 1)),
-                      'regions': region_metrics(reference, rendered_float, weight, regions),
-                      'files': files, 'contact_sheet': sheet.name})
+                      'regions': region_rows, 'files': files, 'contact_sheet': sheet.name})
     return faces
 
 

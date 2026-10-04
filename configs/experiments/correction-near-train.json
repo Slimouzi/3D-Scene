@@ -1,0 +1,47 @@
+{
+  "name": "correction-near-train",
+  "status": "defined, not run",
+  "question": "Does one cleaning rule defined from training views only (Gaussians whose oriented depth extent comes near the camera in train faces) change validation quality, SSIM, luminance, furniture detail and mirrors, when the same cleaned model is evaluated on every validation face?",
+  "rule": {
+    "name": "near-extent-train-views-v1",
+    "views": "train",
+    "factor": 0.5,
+    "sigma": 3.0,
+    "reference_quantile": 0.05
+  },
+  "rule_origin": "parameters copied from the seed-2 diagnosis definition before any evaluation of this rule; the per-face sets removed from validation cameras in that diagnosis are not reused",
+  "checkpoint": "step_003000.pt",
+  "trainings": [
+    "configs/gsplat-absgs-base-seed0.json",
+    "configs/gsplat-absgs-abs-seed0.json",
+    "configs/gsplat-absgs-base-seed1.json",
+    "configs/gsplat-absgs-abs-seed1.json",
+    "configs/gsplat-absgs-base-seed2.json",
+    "configs/gsplat-absgs-abs-seed2.json",
+    "configs/gsplat-absgs-base-seed3.json",
+    "configs/gsplat-absgs-abs-seed3.json",
+    "configs/gsplat-absgs-base-seed4.json",
+    "configs/gsplat-absgs-abs-seed4.json",
+    "configs/gsplat-absgs-base-seed5.json",
+    "configs/gsplat-absgs-abs-seed5.json"
+  ],
+  "prep_run": "salon-gsplat-009",
+  "partition_sha256": "3f77f8c543330327620d05d340653fd68d645081346e857df2ea559e064be14d",
+  "gate": "run after the six AbsGS pairs are complete (seeds 3-5); separate from the AbsGS comparison",
+  "design": "post-training, in memory then saved as a traced copy; one cleaned model per training (union of train-face classifications); full and cleaned models evaluated on all validation faces",
+  "metrics": [
+    "PSNR and SSIM per validation panorama",
+    "luminance difference render - reference",
+    "furniture PSNR, SSIM and detail ratio (gradient energy render / reference)",
+    "mirror PSNR and SSIM",
+    "glass and contour PSNR",
+    "faces whose SSIM decreases or whose luminance moves away"
+  ],
+  "not_used": [
+    "test set (reserved)",
+    "validation cameras to define the rule",
+    "global size pruning"
+  ],
+  "write_panels": false,
+  "quality_thresholds": "none"
+}

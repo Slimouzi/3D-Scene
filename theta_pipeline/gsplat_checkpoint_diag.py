@@ -120,18 +120,19 @@ def project_like_gsplat(world_to_camera, K, width, height, means, quats, scales,
             'radius_y': np.where(keep, ry, 0).astype(int), 'touches': keep, 'cov_cam': cov_cam}
 
 
-def depth_extent(projection):
-    """Nearest depth reached by the 3-sigma extent along the camera axis (oriented covariance)."""
+def depth_extent(projection, sigma=SIGMA):
+    """Nearest depth reached by the `sigma` extent along the camera axis (oriented covariance)."""
     sigma_z = np.sqrt(np.maximum(projection['cov_cam'][:, 2, 2], 0))
-    return projection['depth'] - SIGMA * sigma_z, sigma_z
+    return projection['depth'] - sigma * sigma_z, sigma_z
 
 
-def near_extent_gaussians(world_to_camera, K, size, means, quats, scales, opacities, reference, factor=NEAR_FACTOR):
+def near_extent_gaussians(world_to_camera, K, size, means, quats, scales, opacities, reference, factor=NEAR_FACTOR,
+                          sigma=SIGMA):
     """Gaussians gsplat renders on the face whose depth extent reaches nearer than factor x reference."""
     if reference is None:
         return np.zeros(len(means), bool)
     projection = project_like_gsplat(world_to_camera, K, size, size, means, quats, scales, opacities)
-    nearest, _ = depth_extent(projection)
+    nearest, _ = depth_extent(projection, sigma)
     return projection['touches'] & (nearest < factor * reference)
 
 
