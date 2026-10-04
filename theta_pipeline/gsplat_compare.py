@@ -30,6 +30,22 @@ def inspection_at(prep, name, checkpoint):
             'train': keep(data['results']['train/full']), 'gaussians': data['gaussians']}
 
 
+def panoramas_at(row):
+    """Per validation panorama: faces, usable faces, mean PSNR and SSIM of one validation row."""
+    out = {}
+    for camera in (row or {}).get('cameras', []):
+        entry = out.setdefault(Path(camera['camera']).stem, {'faces': 0, 'usable': 0, 'psnr': [], 'ssim': []})
+        entry['faces'] += 1
+        if not camera.get('excluded') and camera.get('psnr') is not None:
+            entry['usable'] += 1
+            entry['psnr'].append(camera['psnr'])
+            if camera.get('ssim') is not None:
+                entry['ssim'].append(camera['ssim'])
+    mean = lambda v: sum(v) / len(v) if v else None
+    return {k: {'faces': v['faces'], 'usable': v['usable'], 'psnr': mean(v['psnr']), 'ssim': mean(v['ssim'])}
+            for k, v in sorted(out.items())}
+
+
 def arm_summary(prep, name):
     folder = Path(prep) / 'training' / name
     if not (folder / 'training.json').exists():
@@ -63,6 +79,9 @@ def arm_summary(prep, name):
             'validation_curve': [{'step': step, 'mean_psnr': row['mean_psnr'], 'mean_ssim': row['mean_ssim'],
                                   'usable': row.get('usable_cameras')} for step, row in sorted(validation.items())],
             'selected_checkpoint': selection.get('checkpoint'),
+            'val_psnr_selected': pick(selection.get('step'), 'mean_psnr'),
+            'val_ssim_selected': pick(selection.get('step'), 'mean_ssim'),
+            'panoramas_selected': panoramas_at(validation.get(selection.get('step'))),
             'last_step': last, 'val_psnr_last': pick(last, 'mean_psnr'), 'val_ssim_last': pick(last, 'mean_ssim'),
             'usable_validation_faces': pick(last, 'usable_cameras'),
             'selected_step': selection.get('step'), 'test_used': selection.get('test_used'),
@@ -244,6 +263,12 @@ def paired(experiment, prep, noise=None):
                                              a.get('val_psnr_3000_by_panorama') or {}, k)
                                for k in sorted(set(a.get('val_psnr_3000_by_panorama') or {})
                                                | set(b.get('val_psnr_3000_by_panorama') or {}))}}
+        row['selected'] = {'baseline_step': a.get('selected_step'), 'variant_step': b.get('selected_step'),
+                           'psnr': difference(b, a, 'val_psnr_selected'), 'ssim': difference(b, a, 'val_ssim_selected'),
+                           'by_panorama': {k: difference((b.get('panoramas_selected') or {}).get(k) or {},
+                                                         (a.get('panoramas_selected') or {}).get(k) or {}, 'psnr')
+                                           for k in sorted(set(a.get('panoramas_selected') or {})
+                                                           | set(b.get('panoramas_selected') or {}))}}
         row['absolute'] = {role: {'psnr': arm.get('val_psnr_3000'), 'ssim': arm.get('val_ssim_3000'),
                                   'panoramas': arm.get('panoramas_3000'), 'selected': arm.get('selected_checkpoint'),
                                   'curve': arm.get('validation_curve')}
@@ -294,6 +319,20 @@ def paired(experiment, prep, noise=None):
             row['absolute'][role]['minus_median_of_other_seeds'] = (
                 own - statistics.median(others) if own is not None and others else None)
     summary['validation_panoramas'] = sorted({p for r in rows for p in r['by_panorama']})
+    summary['selected'] = {'psnr': describe(r['selected']['psnr'] for r in rows),
+                           'ssim': describe(r['selected']['ssim'] for r in rows),
+                           'by_panorama': {k: describe(r['selected']['by_panorama'].get(k) for r in rows)
+                                           for k in summary['validation_panoramas']}}
+    # Sign consistency of region differences, per panorama: a positive aggregate can hide reversals.
+    summary['region_signs'] = {}
+    for pano in summary['validation_panoramas']:
+        for region in REGIONS:
+            values = [(r['seed'], (r.get('regions_by_panorama') or {}).get(pano, {}).get(region)) for r in rows]
+            known = [(seed, v) for seed, v in values if v is not None]
+            if known:
+                summary['region_signs'][f'{pano}/{region}'] = {
+                    'positive_seeds': [s for s, v in known if v > 0], 'negative_seeds': [s for s, v in known if v < 0],
+                    'values': {s: v for s, v in known}}
     if noise and summary['psnr']:
         gaps = [abs(r['psnr']) for r in rows if r['psnr'] is not None]
         summary['psnr_vs_noise'] = {'noise_db': noise['psnr_db'], 'source': noise.get('source'),
@@ -369,6 +408,28 @@ def paired_report(result):
                 lines.append(f"| {r['seed']} | {pano} | " + ' | '.join(
                     'absente' if (r['coverage'] or {}).get(pano, {}).get(k, {}).get('absent') else fmt(values.get(k))
                     for k in REGIONS) + ' |')
+    lines += ['', f'## Checkpoints sélectionnés par la validation ({variant} − {base})', '',
+              'Comparaison complémentaire de celle à 3 000. Le checkpoint est choisi sur ces mêmes vues de '
+              'validation : ce n’est pas une mesure indépendante de généralisation.', '',
+              '| Graine | Étape choisie ' + base + ' / ' + variant + ' | ΔPSNR | ΔSSIM | '
+              + ' | '.join(f'ΔPSNR {p}' for p in panoramas) + ' |',
+              '|---:|---|---:|---:|' + '---:|' * len(panoramas)]
+    for r in result['pairs']:
+        sel = r['selected']
+        lines.append(f"| {r['seed']} | {sel['baseline_step']} / {sel['variant_step']} | {fmt(sel['psnr'])} | "
+                     f"{fmt(sel['ssim'])} | " + ' | '.join(fmt(sel['by_panorama'].get(p)) for p in panoramas) + ' |')
+    chosen = result['summary']['selected']
+    if chosen['psnr']:
+        lines.append(f"\nMoyenne ΔPSNR aux checkpoints choisis : {chosen['psnr']['mean']:+.3f} dB "
+                     f"(médiane {chosen['psnr']['median']:+.3f}, > 0 : {chosen['psnr']['positive']}/{chosen['psnr']['n']}).")
+    signs = result['summary'].get('region_signs') or {}
+    if signs:
+        lines += ['', '## Cohérence des signes par panorama et par région (étape 3 000)', '',
+                  'Un écart agrégé positif peut masquer des reculs sur un panorama ou une région.', '',
+                  '| Panorama / région | Graines en hausse | Graines en baisse | Écarts par graine |', '|---|---|---|---|']
+        for key, value in signs.items():
+            detail = ', '.join(f'{seed}: {v:+.2f}' for seed, v in sorted(value['values'].items()))
+            lines.append(f"| {key} | {value['positive_seeds'] or '—'} | {value['negative_seeds'] or '—'} | {detail} |")
     lines += ['', '## Synthèse sur les graines', '',
               '| Quantité | n | moyenne | médiane | écart-type | > 0 | < 0 |', '|---|---:|---:|---:|---:|---:|---:|']
     items = [('PSNR', result['summary']['psnr']), ('SSIM', result['summary']['ssim']),

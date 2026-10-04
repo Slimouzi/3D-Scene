@@ -160,3 +160,49 @@ class SheetTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CheckpointDiagnosisTests(unittest.TestCase):
+    """Obstruction test geometry, non-finite accounting, report; no GPU needed."""
+
+    def camera(self):
+        return np.eye(4).tolist(), [[8., 0, 8], [0, 8, 8], [0, 0, 1]], 16
+
+    def test_reference_depth_and_near_gaussians(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        T, K, size = self.camera()
+        points = np.array([[0, 0, 2.], [.1, 0, 4.], [0, 0, -3.], [50, 0, 1.]])   # behind and outside ignored
+        reference = cd.reference_depth(T, K, size, points, quantile=0.)
+        self.assertEqual(reference, 2.)
+        means = np.array([[0, 0, .5], [0, 0, 1.5], [0, 0, -.2], [30, 0, .5]])
+        near = cd.near_gaussians(T, K, size, means, reference)          # depth < 0.5 x 2.0, inside, in front
+        np.testing.assert_array_equal(near, [True, False, False, False])
+        self.assertFalse(cd.near_gaussians(T, K, size, means, None).any())
+        self.assertIsNone(cd.reference_depth(T, K, size, np.array([[0, 0, -1.]])))
+
+    def test_population_reports_non_finite_values(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        params = {'means': np.array([[0, 0, 0], [np.nan, 0, 0], [1, 1, 1.]]),
+                  'scales': np.log(np.full((3, 3), .1)), 'opacities': np.array([2., 0., np.inf]),
+                  'quats': np.zeros((3, 4)), 'sh0': np.zeros((3, 1, 3)), 'shN': np.zeros((3, 3, 3))}
+        result = cd.population(params, np.array([[0, 0, 0], [1, 1, 1.]]), 2., .1)
+        self.assertEqual(result['count_total'], 3)
+        self.assertEqual(result['non_finite']['means'], {'nan': 1, 'inf': 0})
+        self.assertEqual(result['non_finite']['opacities'], {'nan': 0, 'inf': 1})
+        self.assertEqual(result['count'], 1)                            # statistics over finite Gaussians only
+
+    def test_report_and_test_set_refusal(self):
+        from theta_pipeline import gsplat_checkpoint_diag as cd
+        face = lambda psnr: {'psnr': psnr, 'ssim': .7, 'low_alpha_fraction_of_valid': .01, 'near_gaussians': 3,
+                             'near_opaque_gaussians': 1, 'near_alpha_fraction_of_valid': .02}
+        pop = {'count_total': 10, 'non_finite': {'means': {'nan': 0, 'inf': 0}}, 'opacity_quantiles': {},
+               'max_scale_over_scene_scale_quantiles': {'p95': .01, 'max': .2},
+               'outside_sfm_points_box_plus_25pct': 2, 'outside_and_opaque_over_0_5': 1}
+        result = {'training': 't', 'set': 'validation', 'panorama': 'R0010011', 'hypothesis': 'h', 'near_rule': 'r',
+                  'checkpoints': {'step_002000.pt': {'population': pop}, 'step_003000.pt': {'population': pop}},
+                  'faces': {'pano_camera0/R0010011.png': {'step_002000.pt': face(18.), 'step_003000.pt': face(16.5)}}}
+        text = cd.report(result)
+        self.assertIn('-1.50', text)
+        self.assertIn('aucune', text)
+        with self.assertRaisesRegex(RuntimeError, 'test set'):
+            cd.diagnose('unused', {}, ['a', 'b'], 'R0010008', group='test')

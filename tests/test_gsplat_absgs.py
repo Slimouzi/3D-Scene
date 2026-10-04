@@ -175,5 +175,26 @@ class AbsoluteAndCoverageTests(unittest.TestCase):
             self.assertIn('n’isole pas à lui seul le non-déterminisme GPU', text)
             self.assertNotIn('| mirror | 0.000', text)
 
+    def test_selected_checkpoints_and_region_signs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prep = Path(temp)
+            for seed in (0, 1, 2):
+                self.make(prep, f'absgs-base-seed{seed}', {'R0010006': 18., 'R0010011': 17.})
+                variant = {'R0010006': 18.3, 'R0010011': 16.8 if seed == 0 else 17.3}
+                self.make(prep, f'absgs-abs-seed{seed}', variant, ssim=.72)
+            # Seed 2 baseline selected at step 2000 (validation curve value 17.0 for the arm mean).
+            write(prep / 'training/absgs-base-seed2/selection.json',
+                  {'step': 2000, 'checkpoint': 'step_002000.pt', 'test_used': False})
+            result = gsplat_compare.paired(EXPERIMENT, prep)
+            seed2 = next(r for r in result['pairs'] if r['seed'] == 2)
+            self.assertEqual((seed2['selected']['baseline_step'], seed2['selected']['variant_step']), (2000, 3000))
+            self.assertAlmostEqual(seed2['selected']['psnr'], 17.8 - 17.0)
+            signs = result['summary']['region_signs']['R0010011/glass']
+            self.assertEqual((signs['positive_seeds'], signs['negative_seeds']), ([1, 2], [0]))
+            text = gsplat_compare.paired_report(result)
+            self.assertIn('pas une mesure indépendante de généralisation', text)
+            self.assertIn('Cohérence des signes', text)
+            self.assertIn('| R0010011/glass | [1, 2] | [0] |', text)
+
 if __name__ == '__main__':
     unittest.main()
