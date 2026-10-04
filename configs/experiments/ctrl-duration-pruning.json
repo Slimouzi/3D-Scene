@@ -1,0 +1,43 @@
+{
+  "name": "ctrl-duration-pruning",
+  "status": "defined, not run",
+  "question": "Do longer training and training-time large-Gaussian pruning change validation quality, separately?",
+  "gate": "run only if camera_check.md shows coherent cameras (reprojection consistent with SfM, no dimension, intrinsics or pose anomaly) and train-full renders do not reveal an input defect",
+  "design": "2 x 2 factorial: duration {3000, 10000} x pruning {s0: none, s1: large-Gaussian pruning 1100-2400}",
+  "arms": [
+    "configs/gsplat-ctrl-3k-s0.json",
+    "configs/gsplat-ctrl-3k-s1.json",
+    "configs/gsplat-ctrl-10k-s0.json",
+    "configs/gsplat-ctrl-10k-s1.json"
+  ],
+  "held_constant": [
+    "partition 3949e717...aaae (salon-split-005)",
+    "prepared inputs: one prep run for all arms",
+    "seed 0, camera order generator",
+    "densification window i = 600..2400",
+    "learning rates and position decay (over 3000 steps, then constant)",
+    "SH degree schedule capped at 2",
+    "loss (weighted L1 + masked SSIM, lambda 0.2)"
+  ],
+  "prep_run": "salon-gsplat-007 (new preparation at the current commit; same partition and sources)",
+  "reference": "salon-gsplat-006 / l4-short-001 kept intact; ctrl-3k-s0 is its replicate and measures run-to-run variation",
+  "metrics": {
+    "primary": "mean validation PSNR over usable faces at step 3000 (all arms) and at the last step",
+    "secondary": [
+      "mean validation SSIM",
+      "per-region validation PSNR (glass, mirror, unvalidated reflective, furniture, contours, other)",
+      "same metrics on the inspected train faces",
+      "Gaussian count, large Gaussians, out-of-box Gaussians"
+    ]
+  },
+  "reading": {
+    "duration effect": "10k vs 3k with the same pruning (s0 and s1); also final vs step 3000 inside a 10k arm",
+    "pruning effect": "s1 vs s0 at the same duration",
+    "noise": "ctrl-3k-s0 vs the reference l4-short-001"
+  },
+  "not_used": [
+    "test set (reserved; evaluate-test --final not run)",
+    "post-training removal of Gaussians"
+  ],
+  "quality_thresholds": "none: differences are reported with the replicate as noise reference"
+}

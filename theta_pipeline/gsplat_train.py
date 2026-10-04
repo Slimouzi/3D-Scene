@@ -111,6 +111,19 @@ def render(params, viewmats, Ks, width, height, sh_degree):
     return renders, info
 
 
+def means_lr_factor(cfg):
+    """Multiplier of the initial position learning rate at iteration i (picklable callable)."""
+    return MeansLrFactor(cfg['means_lr_final_ratio'], cfg.get('means_lr_decay_steps', cfg['steps']))
+
+
+class MeansLrFactor:
+    def __init__(self, ratio, steps):
+        self.ratio, self.steps = ratio, steps
+
+    def __call__(self, i):
+        return self.ratio ** (min(i, self.steps) / self.steps)
+
+
 def densification_schedule(cfg):
     """0-based iterations at which gsplat 1.5.3 DefaultStrategy acts, from its own conditions.
 
@@ -287,9 +300,12 @@ def train(train_data, val_data, points, cfg, out, meta, resume=False, device='cu
         state = strategy.initialize_state(scene_scale=scale)
         generator = torch.Generator().manual_seed(cfg['seed'])
     strategy.check_sanity(params, optimizers)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizers['means'], gamma=cfg['means_lr_final_ratio'] ** (1. / cfg['steps']))
+    # Positions: exponential decay to means_lr_final_ratio over means_lr_decay_steps (default:
+    # all steps), then held constant, so trials of different length can share the same decay.
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizers['means'], means_lr_factor(cfg))
     if scheduler_state:
+        if 'lr_lambdas' not in scheduler_state:
+            raise RuntimeError('checkpoint uses another learning-rate scheduler; cannot resume')
         scheduler.load_state_dict(scheduler_state)
     n = len(train_data['names'])
     began = time.monotonic()
