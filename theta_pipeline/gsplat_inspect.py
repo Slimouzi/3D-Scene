@@ -191,26 +191,37 @@ class Sources:
         return self.cache[pano]
 
 
-def render_face(params, data, i, degree):
+# Read-only rendering modes. 'historique' is the EWA rasterization used for training and every
+# earlier inspection; '3dgut' renders the same parameters with gsplat's unscented-transform
+# projection and 3-D (world-space) evaluation. Everything else is shared and explicit.
+COMMON_RENDER = {'packed': False, 'render_mode': 'RGB+ED', 'rasterize_mode': 'classic', 'camera_model': 'pinhole',
+                 'eps2d': .3, 'near_plane': .01}
+RENDERERS = {'historique': {**COMMON_RENDER, 'with_ut': False, 'with_eval3d': False},
+             '3dgut': {**COMMON_RENDER, 'with_ut': True, 'with_eval3d': True}}
+
+
+def render_face(params, data, i, degree, renderer='historique'):
     import torch
     from gsplat import rasterization
+    if renderer not in RENDERERS:
+        raise ValueError(f'unknown renderer {renderer}; choose among {sorted(RENDERERS)}')
     with torch.no_grad():
         renders, alphas, _ = rasterization(
             means=params['means'], quats=params['quats'], scales=torch.exp(params['scales']),
             opacities=torch.sigmoid(params['opacities']), colors=torch.cat([params['sh0'], params['shN']], 1),
             viewmats=data['viewmats'][i:i + 1], Ks=data['Ks'][i:i + 1], width=data['width'],
-            height=data['height'], sh_degree=degree, packed=False, render_mode='RGB+ED')
+            height=data['height'], sh_degree=degree, **RENDERERS[renderer])
     return renders[0, ..., :3].clamp(0, 1), alphas[0, ..., 0], renders[0, ..., 3]
 
 
-def export_faces(target, cameras, data, params, degree, sources, write_panels=True):
+def export_faces(target, cameras, data, params, degree, sources, write_panels=True, renderer='historique'):
     """Per-face metrics (PSNR, SSIM, luminance, per-region PSNR/SSIM/detail) and, optionally, panels."""
     import torch
     from . import gsplat_train
     from .gsplat_checkpoint_diag import luminance
     faces = []
     for i, camera in enumerate(cameras):
-        rgb, alpha, depth = render_face(params, data, i, degree)
+        rgb, alpha, depth = render_face(params, data, i, degree, renderer)
         metrics = gsplat_train.view_metrics(rgb[None], data['images'][i:i + 1].float() / 255,
                                             data['weights'][i:i + 1].float() / 255)
         reference = data['images'][i].cpu().numpy()

@@ -103,6 +103,22 @@ class GsplatGpu(unittest.TestCase):
         both = (mine > 0).all(1) & (theirs > 0).all(1)
         self.assertLessEqual(int(np.abs(mine[both] - theirs[both]).max()), 1)
 
+    def test_historical_and_3dgut_render_the_same_parameters(self):
+        import torch
+        from theta_pipeline import gsplat_inspect
+        params = {'means': torch.tensor([[0., 0., 2.]], device='cuda'), 'quats': torch.tensor([[1., 0, 0, 0]], device='cuda'),
+                  'scales': torch.log(torch.full((1, 3), .2, device='cuda')),
+                  'opacities': torch.logit(torch.tensor([.9], device='cuda')),
+                  'sh0': torch.tensor([[[1.5, -1.5, -1.5]]], device='cuda'), 'shN': torch.zeros(1, 3, 3, device='cuda')}
+        data = {'viewmats': torch.eye(4, device='cuda')[None], 'Ks': torch.tensor([[[8., 0, 4], [0, 8, 4], [0, 0, 1]]], device='cuda'),
+                'width': 8, 'height': 8}
+        for mode in ('historique', '3dgut'):
+            rgb, alpha, depth = gsplat_inspect.render_face(params, data, 0, 1, mode)
+            self.assertEqual(tuple(rgb.shape), (8, 8, 3), mode)
+            self.assertTrue(bool(torch.isfinite(rgb).all() and torch.isfinite(depth).all()), mode)
+            self.assertGreater(float(alpha[4, 4]), .5, mode)
+            self.assertAlmostEqual(float(depth[4, 4]), 2., delta=.3)
+
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train
         rng = np.random.default_rng(0)

@@ -127,7 +127,8 @@ def verify_prep(prep):
 # training commit is clean and recorded); every other module produced or checked the inputs.
 TRAINING_MODULES = {'gsplat_train.py', 'gsplat_preflight.py', 'gsplat_inspect.py', 'gsplat_compare.py',
                     'gsplat_divergence.py', 'gsplat_sheet.py', 'gsplat_camera_check.py',
-                    'gsplat_checkpoint_diag.py', 'gsplat_clean.py'}
+                    'gsplat_checkpoint_diag.py', 'gsplat_clean.py',
+                    'gsplat_render_compare.py'}
 
 
 def code_differences(prep_code, current):
