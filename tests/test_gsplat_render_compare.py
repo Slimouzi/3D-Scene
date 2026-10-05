@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+import weakref
 from pathlib import Path
 import numpy as np
 
@@ -47,14 +48,18 @@ class RenderCompareTests(unittest.TestCase):
         fake = types.ModuleType('gsplat')
 
         self.fault = None
+        self.rgb_value = {'historique': .5, '3dgut': .4}
+        self.returned, self.alive_at_call = [], []
 
         def rasterization(**kwargs):
             self.calls.append(kwargs)
+            # Earlier outputs still referenced anywhere would inflate a GPU memory measurement.
+            self.alive_at_call.append(sum(1 for ref in self.returned if ref() is not None))
             mode = '3dgut' if kwargs['with_ut'] else 'historique'
             if self.fault and self.fault[0] == mode and self.fault[1] == 'raise':
                 raise RuntimeError('simulated 3DGUT kernel error')
             size = kwargs['width']
-            renders = torch.full((1, size, size, 4), .4 if mode == '3dgut' else .5)
+            renders = torch.full((1, size, size, 4), self.rgb_value[mode])
             renders[..., 3] = 2.
             alphas = torch.ones(1, size, size, 1)
             if self.fault and self.fault[0] == mode:
@@ -65,6 +70,7 @@ class RenderCompareTests(unittest.TestCase):
                 elif self.fault[1] == 'rgb_inf':
                     renders[0, 0, 0, 0] = float('inf')
             radii = torch.tensor([[[3, 4], [0, 0]]], dtype=torch.int32)
+            self.returned += [weakref.ref(renders), weakref.ref(alphas), weakref.ref(radii)]
             return renders, alphas, {'radii': radii}
         fake.rasterization = rasterization
         previous = sys.modules.get('gsplat')
@@ -164,7 +170,8 @@ class RenderCompareTests(unittest.TestCase):
                     self.assertIn(key, entry)
         perf = result['performance']
         self.assertEqual(perf['historique']['renders'], 5 * 3)
-        self.assertIn('peak_memory_mb', perf['3dgut'])
+        self.assertIn('peak_render_memory_mb', perf['3dgut'])
+        self.assertIn('baseline_memory_mb', perf['3dgut'])
         self.assertEqual(result['warmup'], 1)
         warmups = 2 * 2                                                      # one per mode and per set
         self.assertEqual(len(self.calls), warmups + 5 * 2 * 3)
@@ -185,6 +192,51 @@ class RenderCompareTests(unittest.TestCase):
             self.assertGreater(face['3dgut']['non_finite'][key], 0)
             self.assertIn('INSPECTION INVALIDE', (target / 'comparison.md').read_text())
             self.assertIn(face['camera'], (target / 'comparison.md').read_text())
+
+    def test_invalid_inspection_returns_non_zero_and_is_not_completed(self):
+        from theta_pipeline.storage import read, write
+        config = self.prep.parent / 'cfg.json'
+        write(config, self.cfg)
+        self.fault = ('3dgut', 'depth_nan')
+        code = self.modules[2].main(['--prep', str(self.prep), '--config', str(config),
+                                     '--checkpoint', 'step_003000.pt', '--repetitions', '1'])
+        self.assertNotEqual(code, 0)
+        folder = next((self.prep / 'inspection' / 'render-compare').iterdir())
+        attempt = read(folder / 'index.json')['attempts'][-1]
+        self.assertEqual(attempt['status'], 'invalid')
+        self.assertFalse(attempt['valid'])
+        report = folder / attempt['folder'] / 'comparison.md'
+        self.assertTrue(report.is_file())                                 # the report is kept
+        self.assertIn('INSPECTION INVALIDE', report.read_text())
+        self.fault = None
+        self.assertEqual(self.modules[2].main(['--prep', str(self.prep), '--config', str(config),
+                                               '--checkpoint', 'step_003000.pt', '--repetitions', '1']), 0)
+
+    def test_no_earlier_render_output_is_alive_during_a_render(self):
+        self.run_compare(train_faces=1, repetitions=3)
+        self.assertGreater(len(self.alive_at_call), 10)
+        self.assertEqual(max(self.alive_at_call), 0)
+
+    def test_overview_error_uses_the_same_rgb_as_the_metrics(self):
+        from PIL import Image
+        from theta_pipeline.storage import read
+        self.rgb_value = {'historique': .5, '3dgut': 1.5}            # raw above 1, displayed as white
+        original = self.modules[3].load_cameras
+
+        def white(prep, group, device, names=None):
+            data = original(prep, group, device, names)
+            data['images'][:] = 255
+            return data
+        self.modules[3].load_cameras = white
+        target = self.run_compare(train_faces=0, repetitions=1)
+        result = read(target / 'comparison.json')
+        self.assertEqual(result['faces'][0]['3dgut']['psnr'], 100.)    # clamped 1.0 equals the white reference
+        overview = np.asarray(Image.open(target / 'overview.jpg').convert('RGB')).astype(int)
+        size, x0, y0 = 160, 260, 24
+        error_3dgut = overview[y0 + size // 2, x0 + 4 * size + size // 2]
+        error_historic = overview[y0 + size // 2, x0 + 2 * size + size // 2]
+        self.assertLess(int(error_3dgut.max()), 40)                    # black: no error, as the metric says
+        self.assertGreater(int(error_historic[0]), 200)                # the historical render really differs
 
     def test_failed_attempt_then_retry(self):
         from theta_pipeline.storage import read

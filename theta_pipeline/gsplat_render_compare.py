@@ -113,7 +113,12 @@ def face_metrics(rgb, target, weight, labels, gsplat_train, inspect):
 
 
 class Timer:
-    """GPU-synchronized wall time and peak memory of one render (CPU fallback without CUDA)."""
+    """GPU-synchronized wall time of one render, and its memory above a baseline taken just before it.
+
+    The baseline (parameters, camera data and anything else resident) is measured after a
+    synchronization, with no earlier render output still referenced on the GPU, so that the
+    reported peak is the render's own allocation. CPU fallback without CUDA.
+    """
 
     def __init__(self, torch):
         self.torch, self.cuda = torch, torch.cuda.is_available()
@@ -122,6 +127,9 @@ class Timer:
         if self.cuda:
             self.torch.cuda.synchronize()
             self.torch.cuda.reset_peak_memory_stats()
+            self.base = self.torch.cuda.memory_allocated()
+        else:
+            self.base = None
         self.start = time.perf_counter()
         return self
 
@@ -129,37 +137,60 @@ class Timer:
         if self.cuda:
             self.torch.cuda.synchronize()
         self.ms = (time.perf_counter() - self.start) * 1000
-        self.peak = self.torch.cuda.max_memory_allocated() if self.cuda else None
+        self.extra = self.torch.cuda.max_memory_allocated() - self.base if self.cuda else None
         return False
 
 
+def to_host(tensor):
+    """An independent CPU copy (even for a CPU tensor), so the source can be released at once."""
+    return tensor.detach().to('cpu', copy=True)
+
+
 def render_mode(inspect, params, data, i, degree, mode, repetitions, torch):
-    """`repetitions` timed renders; returns the first one, timings, peak memory and repetition spread."""
-    times, peaks, outputs, metas = [], [], [], []
-    for _ in range(repetitions):
+    """`repetitions` timed renders. Each output is copied to the CPU and every GPU reference
+    (render, alpha, projection meta) is dropped before the next measurement."""
+    times, extras, bases = [], [], []
+    first, projection = None, None
+    counts = {'rgb': 0, 'alpha': 0, 'depth': 0}
+    spread = {'rgb_max_abs_diff': 0., 'alpha_max_abs_diff': 0., 'depth_max_abs_diff': 0.}
+    for repetition in range(repetitions):
         with Timer(torch) as timer:
             raw, alpha, meta = inspect.render_raw(params, data, i, degree, mode)
+        raw_host, alpha_host = to_host(raw), to_host(alpha)
+        if repetition == 0:
+            projection = projection_statistics(meta)
+        del raw, alpha, meta
         times.append(timer.ms)
-        peaks.append(timer.peak)
-        outputs.append((raw, alpha))
-        metas.append(meta)
-    first_raw, first_alpha = outputs[0]
-    spread = {'rgb_max_abs_diff': 0., 'alpha_max_abs_diff': 0., 'depth_max_abs_diff': 0.}
-    for raw, alpha in outputs[1:]:
-        both = torch.isfinite(raw) & torch.isfinite(first_raw)
-        diff = (raw - first_raw).abs()
-        spread['rgb_max_abs_diff'] = max(spread['rgb_max_abs_diff'], float(diff[..., :3][both[..., :3]].max())
-                                         if both[..., :3].any() else 0.)
-        spread['depth_max_abs_diff'] = max(spread['depth_max_abs_diff'], float(diff[..., 3][both[..., 3]].max())
-                                           if both[..., 3].any() else 0.)
-        finite = torch.isfinite(alpha) & torch.isfinite(first_alpha)
-        spread['alpha_max_abs_diff'] = max(spread['alpha_max_abs_diff'],
-                                           float((alpha - first_alpha).abs()[finite].max()) if finite.any() else 0.)
-    counts = {k: sum(non_finite(raw[..., :3], alpha, raw[..., 3])[k] for raw, alpha in outputs)
-              for k in ('rgb', 'alpha', 'depth')}
-    return {'raw': first_raw, 'alpha': first_alpha, 'meta': metas[0], 'times_ms': times,
-            'peak_memory_bytes': max((p for p in peaks if p is not None), default=None),
-            'repetition_spread': spread, 'non_finite': counts}
+        extras.append(timer.extra)
+        bases.append(timer.base)
+        for key, value in non_finite(raw_host[..., :3], alpha_host, raw_host[..., 3]).items():
+            counts[key] += value
+        if first is None:
+            first = (raw_host, alpha_host)
+            continue
+        both = torch.isfinite(raw_host) & torch.isfinite(first[0])
+        diff = (raw_host - first[0]).abs()
+        for key, channels in (('rgb_max_abs_diff', slice(0, 3)), ('depth_max_abs_diff', slice(3, 4))):
+            mask = both[..., channels]
+            if mask.any():
+                spread[key] = max(spread[key], float(diff[..., channels][mask].max()))
+        finite = torch.isfinite(alpha_host) & torch.isfinite(first[1])
+        if finite.any():
+            spread['alpha_max_abs_diff'] = max(spread['alpha_max_abs_diff'],
+                                               float((alpha_host - first[1]).abs()[finite].max()))
+        del raw_host, alpha_host
+    known = [e for e in extras if e is not None]
+    return {'raw': first[0], 'alpha': first[1], 'projection': projection, 'times_ms': times,
+            'peak_render_memory_bytes': max(known) if known else None,
+            'baseline_memory_bytes': [b for b in bases if b is not None], 'repetition_spread': spread,
+            'non_finite': counts}
+
+
+def displayed_rgb(raw_rgb):
+    """The single RGB used for metrics, sheets and the overview: clamped to [0, 1]; non-finite
+    values (invalid outputs, never measured) are shown as white for +inf/NaN and black for -inf."""
+    import torch
+    return torch.nan_to_num(raw_rgb, nan=1., posinf=1., neginf=0.).clamp(0, 1)
 
 
 def summarize(faces):
@@ -185,13 +216,15 @@ def performance(faces):
     out = {}
     for mode in MODES:
         times = [t for f in faces for t in f[mode]['times_ms']]
-        peaks = [f[mode]['peak_memory_bytes'] for f in faces if f[mode]['peak_memory_bytes'] is not None]
+        peaks = [f[mode]['peak_render_memory_bytes'] for f in faces if f[mode]['peak_render_memory_bytes'] is not None]
+        bases = [b for f in faces for b in f[mode]['baseline_memory_bytes']]
         visible = [f[mode]['projection']['visible_gaussians'] for f in faces
                    if f[mode]['projection']['visible_gaussians'] is not None]
         spread = [f[mode]['repetition_spread'] for f in faces]
         out[mode] = {'renders': len(times), 'time_ms_median': statistics.median(times) if times else None,
                      'time_ms_p95': float(np.quantile(times, .95)) if times else None,
-                     'peak_memory_mb': max(peaks) / 2 ** 20 if peaks else None,
+                     'peak_render_memory_mb': max(peaks) / 2 ** 20 if peaks else None,
+                     'baseline_memory_mb': [min(bases) / 2 ** 20, max(bases) / 2 ** 20] if bases else None,
                      'visible_gaussians_median': statistics.median(visible) if visible else None,
                      'radius_p95_median': statistics.median([f[mode]['projection']['radius_p95'] for f in faces
                                                              if f[mode]['projection']['radius_p95'] is not None] or [0]),
@@ -213,9 +246,8 @@ def overview(rows, size=160):
         draw.text((6, y + 6), row['label'], fill='white')
         panels = [row['reference']]
         for mode in MODES:
-            rgb = row[mode]
-            panels += [np.clip(np.nan_to_num(rgb, nan=1., posinf=1., neginf=0.) * 255, 0, 255).astype(np.uint8),
-                       error_image(row['reference'], np.nan_to_num(rgb, nan=1., posinf=1., neginf=0.) * 255, row['weight'])]
+            rgb = row[mode]                                   # displayed_rgb: the array the metrics used
+            panels += [(rgb * 255).round().astype(np.uint8), error_image(row['reference'], rgb * 255, row['weight'])]
         for k, panel in enumerate(panels):
             out.paste(Image.fromarray(panel).resize((size, size)), (260 + k * size, y))
     return out
@@ -292,8 +324,8 @@ def compare(prep, cfg, checkpoint_name, train_faces=0, repetitions=3, warmup=1):
                     inspect.render_raw(params, data, 0, degree, mode)
             for i, name in enumerate(data['names']):
                 camera = by_name[name]
-                target_rgb = data['images'][i].float() / 255
-                weight = data['weights'][i].float() / 255
+                target_rgb = data['images'][i].float().cpu() / 255          # metrics on CPU copies
+                weight = data['weights'][i].float().cpu() / 255
                 labels = inspect.project_labels(sources.labels(camera['panorama_id']), sources.rotations[name],
                                                 data['width'])
                 row, variants = {'camera': name, 'panorama_id': camera['panorama_id'], 'set': group}, []
@@ -304,22 +336,23 @@ def compare(prep, cfg, checkpoint_name, train_faces=0, repetitions=3, warmup=1):
                     raw, alpha = out['raw'], out['alpha']
                     rgb, depth = raw[..., :3], raw[..., 3]
                     valid = not any(out['non_finite'].values())
+                    shown = displayed_rgb(rgb)
                     entry = {'valid': valid, 'non_finite': out['non_finite'], 'times_ms': out['times_ms'],
-                             'peak_memory_bytes': out['peak_memory_bytes'],
-                             'repetition_spread': out['repetition_spread'],
-                             'projection': projection_statistics(out['meta'])}
+                             'peak_render_memory_bytes': out['peak_render_memory_bytes'],
+                             'baseline_memory_bytes': out['baseline_memory_bytes'],
+                             'repetition_spread': out['repetition_spread'], 'projection': out['projection']}
                     if valid:
-                        entry.update(face_metrics(rgb.clamp(0, 1), target_rgb, weight, labels, gsplat_train, inspect))
+                        entry.update(face_metrics(shown, target_rgb, weight, labels, gsplat_train, inspect))
                         entry.update(output_statistics(alpha, depth, weight))
                     else:
                         invalid.append({'set': group, 'camera': name, 'mode': mode, 'non_finite': out['non_finite']})
                         entry.update(psnr=None, ssim=None, excluded=True, regions={})
                     row[mode] = entry
-                    shown = rgb.clamp(0, 1).cpu().numpy() if valid else np.nan_to_num(rgb.cpu().numpy(), nan=1.)
-                    variants.append({'label': mode + ('' if valid else ' INVALIDE'), 'rgb': np.clip(shown, 0, 1),
+                    shown = shown.numpy()
+                    variants.append({'label': mode + ('' if valid else ' INVALIDE'), 'rgb': shown,
                                      'alpha': np.nan_to_num(alpha.cpu().numpy()), 'depth': depth.cpu().numpy(),
                                      'weight': weight.cpu().numpy(), 'psnr': entry['psnr']})
-                    thumbs[mode] = rgb.cpu().numpy()
+                    thumbs[mode] = shown
                 stem = f"{group}__{name.replace('/', '__').removesuffix('.png')}"
                 sheet(name, data['images'][i].cpu().numpy(), variants, 'erreur absolue 0-0,25').save(
                     target / f'{stem}.jpg', quality=90)
@@ -355,7 +388,9 @@ def compare(prep, cfg, checkpoint_name, train_faces=0, repetitions=3, warmup=1):
         set_status(folder, number, 'failed', error=f'{type(error).__name__}: {error}',
                    traceback=traceback.format_exc(limit=8))
         raise
-    set_status(folder, number, 'completed', valid=result['valid'], invalid_outputs=len(invalid))
+    # An invalid inspection is not a completed one: the report is kept, the status says invalid.
+    set_status(folder, number, 'completed' if result['valid'] else 'invalid', valid=result['valid'],
+               invalid_outputs=len(invalid))
     return target
 
 
@@ -395,12 +430,16 @@ def report(result):
     perf = result['performance']
     lines += ['', f"## Performance et projection ({result['repetitions']} répétitions par face après {result['warmup']} "
                   'rendu(s) d’échauffement)', '',
-              '| Mode | Rendus | Temps médian (ms) | p95 (ms) | Mémoire max (Mo) | Gaussiennes visibles (médiane) '
-              '| Rayon p95 médian (px) | Écart max entre répétitions RGB / profondeur |', '|---|---:|---:|---:|---:|---:|---:|---|']
+              '| Mode | Rendus | Temps médian (ms) | p95 (ms) | Pic du rendu au-dessus de la base (Mo) | Base (Mo, min–max) '
+              '| Gaussiennes visibles (médiane) '
+              '| Rayon p95 médian (px) | Écart max entre répétitions RGB / profondeur |', '|---|---:|---:|---:|---:|---|---:|---:|---|']
     for mode in MODES:
         p = perf[mode]
+        base = '—' if not p['baseline_memory_mb'] else f"{p['baseline_memory_mb'][0]:.1f}–{p['baseline_memory_mb'][1]:.1f}"
         lines.append(f"| {mode} | {p['renders']} | {fmt(p['time_ms_median'])} | {fmt(p['time_ms_p95'])} | "
-                     f"{fmt(p['peak_memory_mb'], 1)} | {fmt(p['visible_gaussians_median'], 0)} | {fmt(p['radius_p95_median'], 1)} | "
+                     f"{fmt(p['peak_render_memory_mb'], 1)} | "
+                     f"{base} | "
+                     f"{fmt(p['visible_gaussians_median'], 0)} | {fmt(p['radius_p95_median'], 1)} | "
                      f"{p['repetition_rgb_max_abs_diff']:.3g} / {p['repetition_depth_max_abs_diff']:.3g} |")
     lines += ['', 'Les répétitions mesurent la variabilité du rendu des mêmes paramètres ; elles ne quantifient pas '
                   'le non-déterminisme de l’entraînement.', '', '## Par face', '',
@@ -436,6 +475,11 @@ def main(argv=None):
         print(f'ERROR: {error}', file=sys.stderr)
         return 1
     print(target / 'comparison.md')
+    result = read(target / 'comparison.json')
+    if not result['valid']:
+        print(f"INVALID: non-finite raw outputs for {len(result['invalid_outputs'])} face/mode pairs; "
+              f"report kept in {target}", file=sys.stderr)
+        return 3
     return 0
 
 
