@@ -200,18 +200,24 @@ RENDERERS = {'historique': {**COMMON_RENDER, 'with_ut': False, 'with_eval3d': Fa
              '3dgut': {**COMMON_RENDER, 'with_ut': True, 'with_eval3d': True}}
 
 
-def render_face(params, data, i, degree, renderer='historique'):
+def render_raw(params, data, i, degree, renderer='historique'):
+    """Unclamped RGB+ED [H, W, 4], alpha [H, W] and gsplat's projection meta (radii, depths, ...)."""
     import torch
     from gsplat import rasterization
     if renderer not in RENDERERS:
         raise ValueError(f'unknown renderer {renderer}; choose among {sorted(RENDERERS)}')
     with torch.no_grad():
-        renders, alphas, _ = rasterization(
+        renders, alphas, meta = rasterization(
             means=params['means'], quats=params['quats'], scales=torch.exp(params['scales']),
             opacities=torch.sigmoid(params['opacities']), colors=torch.cat([params['sh0'], params['shN']], 1),
             viewmats=data['viewmats'][i:i + 1], Ks=data['Ks'][i:i + 1], width=data['width'],
             height=data['height'], sh_degree=degree, **RENDERERS[renderer])
-    return renders[0, ..., :3].clamp(0, 1), alphas[0, ..., 0], renders[0, ..., 3]
+    return renders[0], alphas[0, ..., 0], meta
+
+
+def render_face(params, data, i, degree, renderer='historique'):
+    renders, alphas, _ = render_raw(params, data, i, degree, renderer)
+    return renders[..., :3].clamp(0, 1), alphas, renders[..., 3]
 
 
 def export_faces(target, cameras, data, params, degree, sources, write_panels=True, renderer='historique'):

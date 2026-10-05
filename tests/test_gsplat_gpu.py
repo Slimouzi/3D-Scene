@@ -119,6 +119,57 @@ class GsplatGpu(unittest.TestCase):
             self.assertGreater(float(alpha[4, 4]), .5, mode)
             self.assertAlmostEqual(float(depth[4, 4]), 2., delta=.3)
 
+    @staticmethod
+    def gaussians(means, scales, opacities, colors):
+        import torch
+        n = len(means)
+        rgb = torch.tensor(colors, dtype=torch.float32, device='cuda')
+        return {'means': torch.tensor(means, dtype=torch.float32, device='cuda'),
+                'quats': torch.tensor([[1., 0, 0, 0]] * n, device='cuda'),
+                'scales': torch.log(torch.tensor(scales, dtype=torch.float32, device='cuda')),
+                'opacities': torch.logit(torch.tensor(opacities, dtype=torch.float32, device='cuda')),
+                'sh0': ((rgb - .5) / .28209479177387814)[:, None, :], 'shN': torch.zeros(n, 3, 3, device='cuda')}
+
+    def render_both(self, params, size=32, focal=32.):
+        import torch
+        from theta_pipeline import gsplat_inspect
+        data = {'viewmats': torch.eye(4, device='cuda')[None], 'width': size, 'height': size,
+                'Ks': torch.tensor([[[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1]]], device='cuda')}
+        out = {}
+        for mode in ('historique', '3dgut'):
+            raw, alpha, meta = gsplat_inspect.render_raw(params, data, 0, 1, mode)
+            self.assertTrue(bool(torch.isfinite(raw).all() and torch.isfinite(alpha).all()), mode)
+            self.assertTrue(bool(((alpha >= 0) & (alpha <= 1 + 1e-5)).all()), mode)
+            out[mode] = (raw, alpha, meta)
+        return out
+
+    def test_off_axis_centre_outside_the_image(self):
+        # Centre projects beyond the right edge; its footprint must still reach the edge pixels.
+        params = self.gaussians([[1.2, 0., 2.]], [[.4, .4, .4]], [.9], [[1., 0., 0.]])
+        for mode, (raw, alpha, meta) in self.render_both(params).items():
+            self.assertGreater(float(alpha[16, -1]), .05, mode)
+            self.assertGreater(int((meta['radii'] > 0).all(-1).sum()), 0, mode)
+
+    def test_gaussians_close_to_the_camera_plane(self):
+        # One just beyond the near plane and one large Gaussian whose extent crosses it.
+        params = self.gaussians([[0., 0., .05], [0., 0., .6], [0., 0., 3.]], [[.02] * 3, [.5, .5, .5], [.3] * 3],
+                                [.8, .6, .9], [[0., 1., 0.], [0., 0., 1.], [1., 1., 1.]])
+        results = self.render_both(params)
+        for mode, (raw, alpha, _) in results.items():
+            self.assertGreater(float(alpha[16, 16]), .5, mode)
+
+    def test_semi_transparent_layers(self):
+        # Three centred layers of opacity 0.5: front-to-back compositing gives alpha 1 - 0.5^3 at the centre.
+        params = self.gaussians([[0., 0., 2.], [0., 0., 3.], [0., 0., 4.]], [[.3] * 3] * 3, [.5] * 3,
+                                [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
+        results = self.render_both(params)
+        for mode, (raw, alpha, _) in results.items():
+            self.assertAlmostEqual(float(alpha[16, 16]), .875, delta=.05, msg=mode)
+            depth = float(raw[16, 16, 3])
+            self.assertTrue(2. <= depth <= 4., (mode, depth))
+        gap = abs(float(results['historique'][0][16, 16, 3]) - float(results['3dgut'][0][16, 16, 3]))
+        self.assertLess(gap, .25)
+
     def test_train_checkpoint_resume_and_refuse_foreign_config(self):
         from theta_pipeline import gsplat_train
         rng = np.random.default_rng(0)
